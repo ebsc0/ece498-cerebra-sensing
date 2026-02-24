@@ -61,6 +61,9 @@ class DatabaseManager:
             self.connection = sqlite3.connect(self.db_file, check_same_thread=False)
             self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA foreign_keys = ON")
+            # Better write/read concurrency and throughput for streaming inserts.
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            self.connection.execute("PRAGMA synchronous = NORMAL")
             logging.info(f"Connected to database: {self.db_file}")
             self._create_tables()
         except (sqlite3.Error, OSError) as e:
@@ -390,6 +393,53 @@ class DatabaseManager:
                 self.connection.commit()
         except sqlite3.Error as e:
             logging.error(f"Error inserting preprocessed sample: {e}")
+            raise
+
+    def insert_preprocessed_samples_batch(
+        self,
+        session_id: int,
+        samples: List[tuple]
+    ):
+        """
+        Batch insert preprocessed samples for better performance.
+
+        Args:
+            session_id: The session these samples belong to.
+            samples: List of tuples (sample_id, frame_number, timestamp_ms, PreprocessedSample)
+        """
+        if not self.connection:
+            raise RuntimeError("Database connection is not open")
+
+        sql = """
+            INSERT INTO preprocessed_samples (
+                sample_id, session_id, optode_id, frame_number, timestamp_ms,
+                od_nm740_short, od_nm740_long, od_nm860_short, od_nm860_long,
+                hbo_short, hbr_short, hbo_long, hbr_long
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        try:
+            with self.lock:
+                cursor = self.connection.cursor()
+                for sample_id, frame_number, timestamp_ms, sample in samples:
+                    cursor.execute(sql, (
+                        sample_id,
+                        session_id,
+                        sample.optode_id,
+                        frame_number,
+                        timestamp_ms,
+                        sample.od_nm740_short,
+                        sample.od_nm740_long,
+                        sample.od_nm860_short,
+                        sample.od_nm860_long,
+                        sample.hbo_short,
+                        sample.hbr_short,
+                        sample.hbo_long,
+                        sample.hbr_long
+                    ))
+                self.connection.commit()
+        except sqlite3.Error as e:
+            logging.error(f"Error batch inserting preprocessed samples: {e}")
             raise
 
     def query_latest_preprocessed_samples(

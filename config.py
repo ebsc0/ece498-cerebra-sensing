@@ -9,6 +9,10 @@ SAMPLE_RATE_HZ = 5.0
 # Packet format
 PACKET_FORMAT = '<I5f'  # uint32 metadata + 5 floats
 
+# Buffering safeguards for incomplete or delayed frames
+BUFFER_STALE_TIMEOUT_MS = 2000
+BUFFER_MAX_PENDING_FRAMES = 256
+
 # UI settings
 MAX_PLOT_POINTS = 50
 UI_UPDATE_RATE_HZ = 10.0

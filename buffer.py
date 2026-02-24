@@ -27,10 +27,38 @@ class CompleteFrame(NamedTuple):
 class Buffer:
     """Buffers packets and groups them by frame number."""
 
-    def __init__(self, num_optodes: int):
+    def __init__(
+        self,
+        num_optodes: int,
+        stale_timeout_ms: int = 2000,
+        max_pending_frames: int = 256,
+    ):
         self.num_optodes = num_optodes
+        self.stale_timeout_ms = stale_timeout_ms
+        self.max_pending_frames = max_pending_frames
         self._pending: Dict[int, Dict[int, Packet]] = {}  # frame -> {optode: Packet}
         self._start_time_ms: Optional[int] = None  # Set on first packet
+        self._dropped_frames = 0
+
+    def _evict_stale_and_overflow(self, current_timestamp_ms: int):
+        """Evict stale or excessive pending frames to prevent unbounded growth."""
+        if self._pending:
+            stale_frames = []
+            for frame_number, packets in self._pending.items():
+                oldest_ts = min(tp.timestamp_ms for tp in packets.values())
+                if current_timestamp_ms - oldest_ts > self.stale_timeout_ms:
+                    stale_frames.append(frame_number)
+
+            for frame_number in stale_frames:
+                self._pending.pop(frame_number, None)
+                self._dropped_frames += 1
+
+        if len(self._pending) > self.max_pending_frames:
+            # Drop oldest frame numbers first.
+            overflow = len(self._pending) - self.max_pending_frames
+            for frame_number in sorted(self._pending.keys())[:overflow]:
+                self._pending.pop(frame_number, None)
+                self._dropped_frames += 1
 
     def add_packet(self, packet: bytes) -> Optional[CompleteFrame]:
         """
@@ -51,6 +79,7 @@ class Buffer:
         
         # Relative timestamp from session start
         timestamp_ms = current_time_ms - self._start_time_ms
+        self._evict_stale_and_overflow(timestamp_ms)
 
         if frame not in self._pending:
             self._pending[frame] = {}
@@ -79,6 +108,11 @@ class Buffer:
         """Clear all pending frames and reset start time."""
         self._pending.clear()
         self._start_time_ms = None  # Will be set on first packet
+        self._dropped_frames = 0
+
+    def dropped_frames(self) -> int:
+        """Return total number of dropped incomplete frames."""
+        return self._dropped_frames
 
 
 if __name__ == '__main__':
