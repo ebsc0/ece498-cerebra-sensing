@@ -1,355 +1,215 @@
-"""Preprocessor for converting raw fNIRS data to hemoglobin concentrations.
-
-Interface contract:
-- process_frame(frame, sample_ids) -> Dict[int, PreprocessedResult]
-- process_sample(frame_dict) -> dict | None (streaming helper)
-
-Behavior:
-- Dark subtraction with floor clamp
-- Per-optode baseline collection
-- Optical density via -log(I / I0)
-- Short-channel regression cleanup (beta fit on raw long OD)
-- Low-pass filter on cleaned long OD
-- MBLL conversion for short (raw short OD) and long (filtered long OD)
-"""
-
 import math
-import struct
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, NamedTuple, Optional
-
 import numpy as np
 from scipy.signal import butter, lfilter, lfilter_zi
 
-from buffer import CompleteFrame
-from config import (
-    DPF_LONG,
-    DPF_SHORT,
-    DISTANCE_LONG,
-    DISTANCE_SHORT,
-    PACKET_FORMAT,
-    SAMPLE_RATE_HZ,
-)
-
-# Extinction coefficients (cm^-1 / M)
-# Rows: [740nm, 860nm], Columns: [HbO, HbR]
-EXTINCTION_MATRIX = np.array(
-    [
-        [1486.0, 3843.0],  # 740 nm: [eps_HbO, eps_HbR]
-        [2526.0, 1798.0],  # 860 nm: [eps_HbO, eps_HbR]
-    ],
-    dtype=float,
-)
-_EXT_INV = np.linalg.pinv(EXTINCTION_MATRIX)
-
-# Processing constants
+FS = 10
+CUTOFF = 0.7
 REGRESSION_WINDOW = 5
-SCI_WINDOW = 10
-BASELINE_SECONDS = 3.0
-LOWPASS_CUTOFF_HZ = 0.7
-SCI_LOW_HZ = 0.5
-SCI_HIGH_HZ = 2.5
-ALPHA_860 = 0.05
-ALPHA_740 = 0.10
-BETA_INIT = 0.1
+raw_voltage_SAMPLES = FS * 3
 EPS = 1e-6
+K_HAMPEL = 3
 
+EXTINCTION_MATRIX = np.array([
+    [1486, 3843],   # 740 nm
+    [2526, 1798]    # 860 nm
+])
 
-class PreprocessedResult(NamedTuple):
-    """Result from preprocessing a single optode."""
+DPF = 6.0
+DISTANCE = 4.0
 
-    sample_id: int
-    optode_id: int
-    frame_number: int
-    timestamp_ms: int
-    od_nm740_short: float
-    od_nm740_long: float
-    od_nm860_short: float
-    od_nm860_long: float
-    hbo_short: float
-    hbr_short: float
-    hbo_long: float
-    hbr_long: float
+INV_EXT = np.linalg.pinv(EXTINCTION_MATRIX)
+MBLL_SCALE = 1.0 / (DPF * DISTANCE)
 
-
-@dataclass
-class _OptodeState:
-    """Streaming state for one optode."""
-
-    baseline_count: int = 0
-    baseline_sum_long_740: float = 0.0
-    baseline_sum_long_860: float = 0.0
-    baseline_sum_short_740: float = 0.0
-    baseline_sum_short_860: float = 0.0
-    baseline_ready: bool = False
-    i0_long_740: float = 1.0
-    i0_long_860: float = 1.0
-    i0_short_740: float = 1.0
-    i0_short_860: float = 1.0
-    beta_860: float = BETA_INIT
-    beta_740: float = BETA_INIT
-    short_od_860: Deque[float] = field(default_factory=lambda: deque(maxlen=REGRESSION_WINDOW))
-    short_od_740: Deque[float] = field(default_factory=lambda: deque(maxlen=REGRESSION_WINDOW))
-    long_raw_od_860: Deque[float] = field(default_factory=lambda: deque(maxlen=SCI_WINDOW))
-    long_raw_od_740: Deque[float] = field(default_factory=lambda: deque(maxlen=SCI_WINDOW))
-    zi_860: Optional[np.ndarray] = None
-    zi_740: Optional[np.ndarray] = None
-
-
-def _design_filters(sample_rate_hz: float):
-    """Design low-pass and SCI bandpass filters for the given sample rate."""
-
-    nyquist = sample_rate_hz / 2.0
-    if nyquist <= 0.0:
-        raise ValueError("sample_rate_hz must be positive")
-
-    low_norm = min(max(LOWPASS_CUTOFF_HZ / nyquist, 1e-4), 0.99)
-    low_b, low_a = butter(2, low_norm, btype="low")
-
-    sci_low = max(SCI_LOW_HZ / nyquist, 1e-4)
-    sci_high = min(SCI_HIGH_HZ / nyquist, 0.99)
-    if sci_high <= sci_low:
-        return low_b, low_a, None, None
-
-    sci_b, sci_a = butter(2, [sci_low, sci_high], btype="band")
-    return low_b, low_a, sci_b, sci_a
+b, a = butter(2, CUTOFF / (FS/2), btype="low")
+b_sci, a_sci = butter(2, [0.5 / (FS/2), 2.5 / (FS/2)], btype="band")
 
 
 class Preprocessor:
-    """Converts raw intensity data to optical density and hemoglobin concentrations."""
+    def __init__(self):
+        # Buffers
+        self.short_OD_buffer_860 = []
+        self.short_OD_buffer_740 = []
+        self.long_OD_buffer_740 = []
+        self.long_OD_buffer_860 = []
 
-    def __init__(self, sample_rate_hz: float = SAMPLE_RATE_HZ):
-        self.sample_rate_hz = float(sample_rate_hz)
-        self.baseline_samples = max(1, int(round(self.sample_rate_hz * BASELINE_SECONDS)))
+        # storing post-regression/cleaned 860 and 740 values 
+        self.clean_OD_buffer_860 = []
+        self.clean_OD_buffer_740 = []
 
-        self.dpf_short = DPF_SHORT
-        self.dpf_long = DPF_LONG
-        self.dist_short = DISTANCE_SHORT
-        self.dist_long = DISTANCE_LONG
+        # Regression state
+        self.beta_860 = 0.1
+        self.beta_740 = 0.1
 
-        self.low_b, self.low_a, self.sci_b, self.sci_a = _design_filters(self.sample_rate_hz)
-        self._states: Dict[int, _OptodeState] = {}
+        # Storage of original raw voltage values, for reference and also to establish baseline values for OD calculation
+        self.raw_voltage_long_860 = []
+        self.raw_voltage_long_740 = []
+        self.raw_voltage_short_860 = []
+        self.raw_voltage_short_740 = []
+        self.baseline_ready = False
 
-    def reset(self) -> None:
-        """Reset all optode state, used when starting a new acquisition session."""
-        self._states.clear()
+        # Filter state
+        self.zi_860_motion = None
+        self.zi_740_motion = None
+        self.zi_860_nomotion = None
+        self.zi_740_nomotion = None
 
-    def _get_state(self, optode_id: int) -> _OptodeState:
-        state = self._states.get(optode_id)
-        if state is None:
-            state = _OptodeState()
-            self._states[optode_id] = state
-        return state
+        self.sample_count = 0
+        
+    # Helpers 
+    def mbll_from_od(self, od_740, od_860):
+        delta_od = np.array([od_740, od_860])
+        chromo = INV_EXT @ delta_od
+        HbO = chromo[0] * MBLL_SCALE
+        HbR = chromo[1] * MBLL_SCALE
+        return HbO, HbR
 
-    def _mbll(self, od_740: float, od_860: float, dpf: float, distance: float) -> tuple[float, float]:
-        """Apply Modified Beer-Lambert Law to OD values."""
-
-        delta_od = np.array([od_740, od_860], dtype=float)
-        chromo = _EXT_INV @ delta_od
-        pathlength = max(distance * dpf, EPS)
-        hbo = chromo[0] / pathlength
-        hbr = chromo[1] / pathlength
-        return float(hbo), float(hbr)
-
-    def _apply_lowpass(self, value: float, zi: Optional[np.ndarray]) -> tuple[float, np.ndarray]:
-        if zi is None:
-            zi = lfilter_zi(self.low_b, self.low_a) * value
-        out, zi = lfilter(self.low_b, self.low_a, [value], zi=zi)
-        return float(out[0]), zi
-
-    def _compute_sci(self, state: _OptodeState) -> Optional[float]:
-        if len(state.long_raw_od_740) < SCI_WINDOW:
+    def compute_sci(self):
+        if len(self.long_OD_buffer_740) < 10:
             return None
 
-        sig_740 = np.array(state.long_raw_od_740, dtype=float)
-        sig_860 = np.array(state.long_raw_od_860, dtype=float)
+        sig_740 = np.array(self.long_OD_buffer_740[-10:])
+        sig_860 = np.array(self.long_OD_buffer_860[-10:])
 
         if np.std(sig_740) < 1e-8 or np.std(sig_860) < 1e-8:
             return 0.0
 
-        if self.sci_b is not None and self.sci_a is not None:
-            filt_740 = lfilter(self.sci_b, self.sci_a, sig_740)
-            filt_860 = lfilter(self.sci_b, self.sci_a, sig_860)
+        filt_740 = lfilter(b_sci, a_sci, sig_740)
+        filt_860 = lfilter(b_sci, a_sci, sig_860)
+
+        c = np.corrcoef(filt_740, filt_860)[0, 1]
+        return float(c) if np.isfinite(c) else 0.0
+    
+    def hampel(x_buffer, window, k):
+        if len(x_buffer) < window:
+            return x_buffer[-1]
+
+        win = np.array(x_buffer[-window:])
+        med = np.median(win)
+        mad = np.median(np.abs(win - med))
+        # Convert MAD → robust std estimate
+        sigma = 1.4826 * mad
+        # Prevent divide / threshold collapse
+        if sigma < 1e-12:
+            return x_buffer[-1]
+
+        latest = x_buffer[-1]
+        if np.abs(latest - med) > k * sigma:
+            return med
         else:
-            filt_740 = sig_740
-            filt_860 = sig_860
+            return latest
 
-        corr = np.corrcoef(filt_740, filt_860)[0, 1]
-        return float(corr) if np.isfinite(corr) else 0.0
+    def update_regression(self, short_buf, long_buf, beta, alpha):
+        if len(short_buf) >= REGRESSION_WINDOW and len(long_buf) >= REGRESSION_WINDOW:
+            s = np.array(short_buf[-REGRESSION_WINDOW:])
+            l = np.array(long_buf[-REGRESSION_WINDOW:])
+            if np.var(s) > EPS:
+                beta_new = np.cov(s, l)[0,1] / np.var(s)
+                beta = (1 - alpha) * beta + alpha * beta_new
+        return beta
 
-    def _update_beta(
-        self,
-        short_samples: Deque[float],
-        long_raw_samples: Deque[float],
-        beta: float,
-        alpha: float,
-    ) -> float:
-        if len(short_samples) < REGRESSION_WINDOW or len(long_raw_samples) < REGRESSION_WINDOW:
-            return beta
+    def apply_filter(self, value, zi):
+        if zi is None:
+            zi = lfilter_zi(b, a) * value
+        out, zi = lfilter(b, a, [value], zi=zi)
+        return out[0], zi
 
-        s = np.array(short_samples, dtype=float)
-        l = np.array(long_raw_samples, dtype=float)[-REGRESSION_WINDOW:]
-        var_s = np.var(s)
-        if var_s <= EPS:
-            return beta
-
-        beta_new = np.cov(s, l)[0, 1] / var_s
-        return float((1.0 - alpha) * beta + alpha * beta_new)
-
-    def _process_values(
-        self,
-        optode_id: int,
-        long_740: float,
-        long_860: float,
-        short_740: float,
-        short_860: float,
-        dark: float,
-    ) -> Optional[dict]:
-        state = self._get_state(optode_id)
-
-        # Dark subtraction + floor clamp
-        long_740 = max(long_740 - dark, EPS)
-        long_860 = max(long_860 - dark, EPS)
-        short_740 = max(short_740 - dark, EPS)
-        short_860 = max(short_860 - dark, EPS)
-
-        # Baseline warmup per optode
-        if not state.baseline_ready:
-            state.baseline_sum_long_740 += long_740
-            state.baseline_sum_long_860 += long_860
-            state.baseline_sum_short_740 += short_740
-            state.baseline_sum_short_860 += short_860
-            state.baseline_count += 1
-
-            if state.baseline_count >= self.baseline_samples:
-                inv_n = 1.0 / state.baseline_count
-                state.i0_long_740 = max(state.baseline_sum_long_740 * inv_n, EPS)
-                state.i0_long_860 = max(state.baseline_sum_long_860 * inv_n, EPS)
-                state.i0_short_740 = max(state.baseline_sum_short_740 * inv_n, EPS)
-                state.i0_short_860 = max(state.baseline_sum_short_860 * inv_n, EPS)
-                state.baseline_ready = True
-
-                # Baseline history no longer needed after I0 is fixed.
-                state.baseline_sum_long_740 = 0.0
-                state.baseline_sum_long_860 = 0.0
-                state.baseline_sum_short_740 = 0.0
-                state.baseline_sum_short_860 = 0.0
-
-            return None
-
-        # Optical density
-        od_long_740 = -math.log(long_740 / state.i0_long_740)
-        od_long_860 = -math.log(long_860 / state.i0_long_860)
-        od_short_740 = -math.log(short_740 / state.i0_short_740)
-        od_short_860 = -math.log(short_860 / state.i0_short_860)
-
-        state.short_od_740.append(od_short_740)
-        state.short_od_860.append(od_short_860)
-        state.long_raw_od_740.append(od_long_740)
-        state.long_raw_od_860.append(od_long_860)
-
-        sci = self._compute_sci(state)
-
-        # Adaptive regression fit against raw long OD (standard form)
-        state.beta_740 = self._update_beta(state.short_od_740, state.long_raw_od_740, state.beta_740, ALPHA_740)
-        state.beta_860 = self._update_beta(state.short_od_860, state.long_raw_od_860, state.beta_860, ALPHA_860)
-
-        clean_od_740 = od_long_740 - state.beta_740 * od_short_740
-        clean_od_860 = od_long_860 - state.beta_860 * od_short_860
-
-        # Low-pass filter cleaned long OD
-        filtered_od_740, state.zi_740 = self._apply_lowpass(clean_od_740, state.zi_740)
-        filtered_od_860, state.zi_860 = self._apply_lowpass(clean_od_860, state.zi_860)
-
-        # MBLL:
-        # - short channel from raw short OD
-        # - long channel from filtered long OD
-        hbo_short, hbr_short = self._mbll(od_short_740, od_short_860, self.dpf_short, self.dist_short)
-        hbo_long, hbr_long = self._mbll(filtered_od_740, filtered_od_860, self.dpf_long, self.dist_long)
-
-        return {
-            "od_short_740": od_short_740,
-            "od_short_860": od_short_860,
-            "od_long_740_raw": od_long_740,
-            "od_long_860_raw": od_long_860,
-            "od_long_740_clean": clean_od_740,
-            "od_long_860_clean": clean_od_860,
-            "od_long_740_filtered": filtered_od_740,
-            "od_long_860_filtered": filtered_od_860,
-            "hbo_short": hbo_short,
-            "hbr_short": hbr_short,
-            "hbo_long": hbo_long,
-            "hbr_long": hbr_long,
-            "sci": sci,
-        }
-
+    # Main streaming entry point
     def process_sample(self, frame: dict) -> dict | None:
-        """Streaming helper API for one optode sample dict."""
+        """
+        Args:
+            frame = {
+                "optode_id": int or str,
+                "time": float
+                "long_860": float,
+                "long_740": float,
+                "short_860": float,
+                "short_740": float,
+                "dark": float
+            }
 
-        optode_id = int(frame["optode_id"])
-        processed = self._process_values(
-            optode_id=optode_id,
-            long_740=float(frame["long_740"]),
-            long_860=float(frame["long_860"]),
-            short_740=float(frame["short_740"]),
-            short_860=float(frame["short_860"]),
-            dark=float(frame["dark"]),
-        )
-        if processed is None:
+        Returns:
+            dict or None (until baseline complete)
+        """
+
+        optode_id = frame["optode_id"]
+        time = frame["time"]
+
+        #dark channel correction
+        long_860 = max(frame["long_860"] - frame["dark"], EPS)
+        long_740 = max(frame["long_740"] - frame["dark"], EPS)
+        short_860 = max(frame["short_860"] - frame["dark"], EPS)
+        short_740 = max(frame["short_740"] - frame["dark"], EPS)
+        
+        self.raw_voltage_long_860.append(long_860)
+        self.raw_voltage_long_740.append(long_740)
+        self.raw_voltage_short_860.append(short_860)
+        self.raw_voltage_short_740.append(short_740)
+
+        # Baseline collection 
+        if not self.baseline_ready:
+            self.sample_count += 1
+
+            if self.sample_count >= raw_voltage_SAMPLES:
+                self.I0_long_860 = np.mean(self.raw_voltage_long_860[:-10])
+                self.I0_long_740 = np.mean(self.raw_voltage_long_740[:-10])
+                self.I0_short_860 = np.mean(self.raw_voltage_short_860[:-10])
+                self.I0_short_740 = np.mean(self.raw_voltage_short_740[:-10])
+                self.baseline_ready = True
             return None
+
+        # Optical density 
+        OD_long_860  = -math.log(long_860 / self.I0_long_860)
+        OD_long_740  = -math.log(long_740 / self.I0_long_740)
+        OD_short_860 = -math.log(short_860 / self.I0_short_860)
+        OD_short_740 = -math.log(short_740 / self.I0_short_740)
+
+        self.short_OD_buffer_860.append(OD_short_860)
+        self.short_OD_buffer_740.append(OD_short_740)
+
+        self.long_OD_buffer_740.append(OD_long_740)
+        self.long_OD_buffer_860.append(OD_long_860)
+
+        if len(self.long_OD_buffer_740) > 10:
+            self.long_OD_buffer_740.pop(0)
+            self.long_OD_buffer_860.pop(0)
+
+        sci = self.compute_sci()
+
+        # Regression 
+        self.beta_860 = self.update_regression(
+            self.short_OD_buffer_860, self.clean_OD_buffer_860, self.beta_860, 0.05
+        )
+        self.beta_740 = self.update_regression(
+            self.short_OD_buffer_740, self.clean_OD_buffer_740, self.beta_740, 0.10
+        )
+
+        clean_OD_860 = OD_long_860 - self.beta_860 * OD_short_860
+        clean_OD_740 = OD_long_740 - self.beta_740 * OD_short_740
+
+        self.clean_OD_buffer_860.append(clean_OD_860)
+        self.clean_OD_buffer_740.append(clean_OD_740)
+
+        # Motion artifact removal (Hampel filter)
+        clean_OD_860_unmotioned = self.hampel(self.clean_OD_buffer_860, REGRESSION_WINDOW, K_HAMPEL) 
+        clean_OD_740_unmotioned = self.hampel(self.clean_OD_buffer_740, REGRESSION_WINDOW, K_HAMPEL)
+
+        # Filtering 
+        filtered_OD_860, zi_860_nomotion = self.apply_filter(clean_OD_860_unmotioned, zi_860_nomotion)
+        filtered_OD_740, zi_740_nomotion = self.apply_filter(clean_OD_740_unmotioned, zi_740_nomotion)
+
+        # MBLL 
+        HbO, HbR = self.mbll_from_od(filtered_OD_740, filtered_OD_860)
 
         return {
             "optode_id": optode_id,
-            "raw": processed["od_long_860_raw"],
-            "clean": processed["od_long_860_clean"],
-            "filtered": processed["od_long_860_filtered"],
-            "HbO": processed["hbo_long"],
-            "HbR": processed["hbr_long"],
-            "SCI": processed["sci"],
+            # should this also return raw voltage values (all 4)
+            "raw_OD_860": OD_long_860,
+            "clean_OD_860": clean_OD_860,
+            "filtered_OD_860": filtered_OD_860,
+            "raw_OD_740": OD_long_740,
+            "clean_OD_740": clean_OD_740,
+            "filtered_OD_740": filtered_OD_740,
+            "HbO": HbO,
+            "HbR": HbR,
+            "SCI": sci # remove?
         }
-
-    def process_frame(
-        self,
-        frame: CompleteFrame,
-        sample_ids: Dict[int, int],
-    ) -> Dict[int, PreprocessedResult]:
-        """Process a complete frame and return preprocessed samples by optode."""
-
-        results: Dict[int, PreprocessedResult] = {}
-
-        for optode_id, packet in frame.packets.items():
-            sample_id = sample_ids.get(optode_id)
-            if sample_id is None:
-                continue
-
-            # Unpack packet:
-            # metadata, nm740_long, nm860_long, nm740_short, nm860_short, dark
-            data = struct.unpack(PACKET_FORMAT, packet)
-            processed = self._process_values(
-                optode_id=optode_id,
-                long_740=float(data[1]),
-                long_860=float(data[2]),
-                short_740=float(data[3]),
-                short_860=float(data[4]),
-                dark=float(data[5]),
-            )
-            if processed is None:
-                continue
-
-            results[optode_id] = PreprocessedResult(
-                sample_id=sample_id,
-                optode_id=optode_id,
-                frame_number=frame.frame_number,
-                timestamp_ms=frame.timestamp_ms,
-                od_nm740_short=processed["od_short_740"],
-                od_nm740_long=processed["od_long_740_filtered"],
-                od_nm860_short=processed["od_short_860"],
-                od_nm860_long=processed["od_long_860_filtered"],
-                hbo_short=processed["hbo_short"],
-                hbr_short=processed["hbr_short"],
-                hbo_long=processed["hbo_long"],
-                hbr_long=processed["hbr_long"],
-            )
-
-        return results
