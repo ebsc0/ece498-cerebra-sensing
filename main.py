@@ -276,6 +276,7 @@ class CerebraApp(App):
             # Run ICH detection
             ich_data = self._prepare_ich_data(preprocessed)
             flags, counts = detect_ich(ich_data, ACTIVE_OPTODES)
+            print("flags: ", flags)
 
             # Update ICH status in UI
             self.screen.update_ich_status(flags, counts)

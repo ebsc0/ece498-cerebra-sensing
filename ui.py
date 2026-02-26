@@ -626,7 +626,7 @@ class MainScreen(Screen):
     def update_ich_status(self, flags: dict, flag_counts: dict = None):
         """Update ICH status display."""
         self.ich_flags = flags or {}
-        any_flagged = any(self.ich_flags.values())
+        any_flagged = any(self.ich_flags.values()) # != "NORMAL"
 
         if not self.ich_flags:
             if self.session_id:

@@ -1,130 +1,209 @@
-"""ICH (Intracranial Hemorrhage) detection algorithms."""
+"""
+Advanced ICH (Intracranial Hemorrhage) detection module.
+"""
 
 from typing import Dict, List, Tuple, Optional
+from collections import deque
 import numpy as np
 
-from config import TOTAL_OPTODES, ACTIVE_OPTODES
+
+# ==============================
+# Configuration
+# ==============================
 
 ASYMMETRY_THRESHOLD_OD = 0.05
-ASYMMETRY_THRESHOLD_HBR = 0.2
-Z_SCORE_THRESHOLD = 2.0
+ASYMMETRY_THRESHOLD_HBT_PERCENT = 0.01
+SLOPE_THRESHOLD = 0.5
+PERSISTENCE_RATIO = 0.6
 
-# Left hemisphere optodes (0-7) pair with right hemisphere (8-15)
+WINDOW_SECONDS = 5
+FS = 10
+WINDOW = WINDOW_SECONDS * FS
+PERSISTENCE_WINDOW = 10
+
 LEFT_OPTODES = list(range(0, 8))
 RIGHT_OPTODES = list(range(8, 16))
 
-# Memory for historical flags (basic version - extend as needed)
-flag_history: Dict[int, List[bool]] = {i: [] for i in range(TOTAL_OPTODES)}
+EPS = 1e-6
 
 
-def detect_ich(
-    optode_data: Dict[int, dict],
-    active_optodes: Optional[List[int]] = None
-) -> Tuple[Dict[int, bool], Dict[int, int]]:
-    """Detect ICH based on optode data.
+# ==============================
+# Internal State
+# ==============================
 
-    This function handles partial optode data gracefully. Only active optodes
-    are analyzed, and hemisphere comparisons are skipped if the paired optode
-    is inactive.
+class OptodeState:
+    def __init__(self):
+        self.hbt_history = deque(maxlen=WINDOW)
+        self.asymmetry_history = deque(maxlen=WINDOW)
+        self.flag_history = deque(maxlen=PERSISTENCE_WINDOW)
 
-    Args:
-        optode_data: {optode_id: {"HbR": float, "OD_860": float}}
-            Only needs to contain data for active optodes.
-        active_optodes: List of optode IDs that have data.
-            Defaults to ACTIVE_OPTODES from config.
 
-    Returns:
-        Tuple of:
-            - final_flags: {optode_id: bool} - True if ICH detected
-            - final_flag_counts: {optode_id: int} - number of criteria met (0-3)
-    """
-    if active_optodes is None:
-        active_optodes = ACTIVE_OPTODES
+state: Dict[int, OptodeState] = {}
 
-    # If no active optodes, return empty results
-    if not active_optodes or not optode_data:
-        return {}, {}
 
-    flags_od: Dict[int, bool] = {}
-    flags_z: Dict[int, bool] = {}
-    flags_roc: Dict[int, bool] = {}
-
-    # Get HbR values for active optodes only
-    active_hbr = {i: optode_data[i]["HbR"] for i in active_optodes if i in optode_data}
-
-    if not active_hbr:
-        return {}, {}
-
-    HbR_values = np.array(list(active_hbr.values()))
-    hbr_by_id = active_hbr
-
-    # Step 1: OD asymmetry (only if both hemisphere pairs are active)
-    for i in active_optodes:
-        if i not in optode_data:
-            continue
-
-        # Find hemisphere pair
-        if i in LEFT_OPTODES:
-            j = i + 8
-        elif i in RIGHT_OPTODES:
-            j = i - 8
-        else:
-            continue
-
-        # Skip if pair is not active
-        if j not in active_optodes or j not in optode_data:
-            continue
-
-        OD_i = optode_data[i].get("OD_860", 0)
-        OD_j = optode_data[j].get("OD_860", 0)
-
-        if OD_i - OD_j > ASYMMETRY_THRESHOLD_OD:
-            flags_od[i] = True
-        elif OD_j - OD_i > ASYMMETRY_THRESHOLD_OD:
-            flags_od[j] = True
-
-    # Step 2: HbR z-score outliers (among active optodes only)
-    if len(HbR_values) > 1:
-        mean_HbR = np.mean(HbR_values)
-        std_HbR = np.std(HbR_values) + 1e-6
-
-        for i in active_optodes:
-            if i not in hbr_by_id:
-                continue
-            z = (hbr_by_id[i] - mean_HbR) / std_HbR
-            if z > Z_SCORE_THRESHOLD:
-                flags_z[i] = True
-
-    # Step 3: Historical rate-of-change detection (sustained flag)
-    for i in active_optodes:
-        is_flagged_now = flags_od.get(i, False) or flags_z.get(i, False)
-        flag_history[i].append(is_flagged_now)
-
-        # Keep last 5 frames
-        if len(flag_history[i]) > 5:
-            flag_history[i] = flag_history[i][-5:]
-
-        # Sustained anomaly in 3 of last 5
-        if sum(flag_history[i]) >= 3:
-            flags_roc[i] = True
-
-    # Step 4: Ensemble flag (need at least 2 criteria met)
-    final_flags: Dict[int, bool] = {}
-    final_flag_counts: Dict[int, int] = {}
-
-    for i in active_optodes:
-        count = sum([
-            flags_od.get(i, False),
-            flags_z.get(i, False),
-            flags_roc.get(i, False)
-        ])
-        final_flags[i] = count >= 2
-        final_flag_counts[i] = count
-
-    return final_flags, final_flag_counts
+def get_state(optode_id: int) -> OptodeState:
+    if optode_id not in state:
+        state[optode_id] = OptodeState()
+    return state[optode_id]
 
 
 def reset_history():
-    """Reset flag history. Call when starting a new session."""
-    global flag_history
-    flag_history = {i: [] for i in range(TOTAL_OPTODES)}
+    global state
+    state = {}
+
+
+# ==============================
+# Utility
+# ==============================
+
+def compute_slope(values: List[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    x = np.arange(len(values))
+    slope, _ = np.polyfit(x, values, 1)
+    return slope
+
+
+def get_paired_optode(optode_id: int) -> Optional[int]:
+    if optode_id in LEFT_OPTODES:
+        return optode_id + 8
+    elif optode_id in RIGHT_OPTODES:
+        return optode_id - 8
+    return None
+
+
+# ==============================
+# Flag Logic (Now Pure)
+# ==============================
+
+def flag_od_asymmetry(od_diff: float) -> bool:
+    return abs(od_diff) > ASYMMETRY_THRESHOLD_OD
+
+
+def flag_hbt_percent_asymmetry(percent_diff: float) -> bool:
+    return percent_diff > ASYMMETRY_THRESHOLD_HBT_PERCENT
+
+
+def flag_dual_wavelength(f_od_860: bool, f_od_740: bool) -> bool:
+    return f_od_860 and f_od_740
+
+
+def flag_slope(slope: float) -> bool:
+    return slope > SLOPE_THRESHOLD
+
+
+def flag_persistence(ratio: float) -> bool:
+    return ratio > PERSISTENCE_RATIO
+
+
+# ==============================
+# Main Detection
+# ==============================
+
+def detect_ich(
+    optode_data: Dict[int, dict],
+    active_optodes: List[int]
+) -> Tuple[Dict[int, str], Dict[int, int]]:
+
+    final_flags = {}
+    flag_counts = {}
+    detailed_flags = {}
+
+    for optode_id in active_optodes:
+
+        if optode_id not in optode_data:
+            continue
+
+        optode_state = get_state(optode_id)
+        pair_id = get_paired_optode(optode_id)
+
+        # ----- Compute Shared Quantities -----
+
+        HbO = optode_data[optode_id].get("HbO", 0)
+        HbR = optode_data[optode_id].get("HbR", 0)
+        HbT = HbO + HbR
+        optode_state.hbt_history.append(HbT)
+
+        OD860 = optode_data[optode_id].get("OD_860", 0)
+        OD740 = optode_data[optode_id].get("OD_740", 0)
+
+        od860_diff = 0
+        od740_diff = 0
+        percent_diff = 0
+
+        if pair_id in optode_data:
+
+            HbO_pair = optode_data[pair_id].get("HbO", 0)
+            HbR_pair = optode_data[pair_id].get("HbR", 0)
+            HbT_pair = HbO_pair + HbR_pair
+
+            OD860_pair = optode_data[pair_id].get("OD_860", 0)
+            OD740_pair = optode_data[pair_id].get("OD_740", 0)
+
+            od860_diff = OD860 - OD860_pair
+            od740_diff = OD740 - OD740_pair
+
+            mean_val = (HbT + HbT_pair) / 2
+            if mean_val > EPS:
+                percent_diff = abs(HbT - HbT_pair) / mean_val
+
+            optode_state.asymmetry_history.append(HbT - HbT_pair)
+
+        slope_val = compute_slope(list(optode_state.asymmetry_history))
+
+        # ----- Evaluate Flags (No Recalculation) -----
+
+        f_od_860 = flag_od_asymmetry(od860_diff)
+        f_od_740 = flag_od_asymmetry(od740_diff)
+        f_hbt = flag_hbt_percent_asymmetry(percent_diff)
+        f_dual = flag_dual_wavelength(f_od_860, f_od_740)
+        f_slope = flag_slope(slope_val)
+
+        any_flag_now = any([
+            f_od_860,
+            f_od_740,
+            f_hbt,
+            f_dual,
+            f_slope
+        ])
+
+        optode_state.flag_history.append(any_flag_now)
+
+        persistence_ratio = (
+            sum(optode_state.flag_history) /
+            len(optode_state.flag_history)
+            if len(optode_state.flag_history) > 0 else 0
+        )
+
+        f_persist = flag_persistence(persistence_ratio)
+
+        flag_count = sum([
+            f_od_860,
+            f_od_740,
+            f_hbt,
+            f_dual,
+            f_slope,
+            f_persist
+        ])
+
+        # Required ensemble logic
+        if flag_count >= 4:
+            final_flags[optode_id] = "POTENTIAL_ICH"
+        elif flag_count >= 2:
+            final_flags[optode_id] = "ABNORMALITY"
+        else:
+            final_flags[optode_id] = "NORMAL"
+
+        flag_counts[optode_id] = flag_count
+
+        detailed_flags[optode_id] = {
+            "od_860": f_od_860,
+            "od_740": f_od_740,
+            "hbt_asym": f_hbt,
+            "dual": f_dual,
+            "slope": f_slope,
+            "persistence": f_persist
+        }
+        print("flag:", final_flags, "flag counts", flag_counts, "flag info", detailed_flags)
+
+    return final_flags, flag_counts

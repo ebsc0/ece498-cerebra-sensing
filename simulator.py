@@ -44,34 +44,77 @@ class Simulator:
         ]
 
     def _generate_packet(self, optode_id: int, frame_number: int) -> bytes:
-        """Generate random fNIRS-like raw values.
-
-        Args:
-            optode_id: optode ID
-            frame_number: frame number
-        
-        Returns:
-            Struct of bytes with packet structure as defined
         """
-        t = frame_number / self.sample_rate_hz if self.sample_rate_hz > 0 else float(frame_number)
-        phase = (2.0 * math.pi * 0.2 * t) + self._optode_phase[optode_id]
-        pulsatile = math.sin(phase)
-        baseline = self._optode_baseline[optode_id]
+        Generate physiologically realistic fNIRS-like signals
+        similar to synthetic_fnirs.py but streaming.
+        """
 
-        long_740 = baseline + 30.0 * pulsatile + self._rng.gauss(0.0, 8.0)
-        long_860 = (baseline * 1.03) + 26.0 * pulsatile + self._rng.gauss(0.0, 8.0)
-        short_740 = (baseline * 0.72) + 12.0 * pulsatile + self._rng.gauss(0.0, 6.0)
-        short_860 = (baseline * 0.75) + 10.0 * pulsatile + self._rng.gauss(0.0, 6.0)
-        dark = max(0.5, 8.0 + self._rng.gauss(0.0, 0.8))
+        t = frame_number / self.sample_rate_hz
 
-        # Ensure channels remain above dark so log-domain preprocessing is valid.
-        min_signal = dark + 1.0
-        long_740 = max(long_740, min_signal)
+        # ----------------------------
+        # Physiological Frequencies
+        # ----------------------------
+        heart_freq = 1.2     # Hz
+        resp_freq = 0.25     # Hz
+        drift_freq = 0.01    # Hz
+
+        def phys_signal(base):
+            return (
+                base
+                + 0.03 * math.sin(2 * math.pi * heart_freq * t)
+                + 0.02 * math.sin(2 * math.pi * resp_freq * t)
+                + 0.05 * math.sin(2 * math.pi * drift_freq * t)
+            )
+
+        # ----------------------------
+        # Baselines (per optode)
+        # ----------------------------
+        long_860_base = 2.0 + 0.1 * optode_id
+        long_740_base = 1.8 + 0.1 * optode_id
+        short_860_base = 1.5 + 0.05 * optode_id
+        short_740_base = 1.3 + 0.05 * optode_id
+        dark_base = 0.02
+
+        # ----------------------------
+        # Clean physiological signal
+        # ----------------------------
+        long_860 = phys_signal(long_860_base)
+        long_740 = phys_signal(long_740_base)
+        short_860 = phys_signal(short_860_base)
+        short_740 = phys_signal(short_740_base)
+        dark = dark_base + 0.002 * math.sin(2 * math.pi * 0.05 * t)
+
+        # ----------------------------
+        # Gaussian noise
+        # ----------------------------
+        noise_std = 0.01
+        long_860 += self._rng.gauss(0.0, noise_std)
+        long_740 += self._rng.gauss(0.0, noise_std)
+        short_860 += self._rng.gauss(0.0, noise_std)
+        short_740 += self._rng.gauss(0.0, noise_std)
+        dark += self._rng.gauss(0.0, 0.002)
+
+        # ----------------------------
+        # Motion spikes (rare, brief)
+        # ----------------------------
+        if self._rng.random() < 0.005:  # 0.5% chance per frame
+            spike_mag = self._rng.uniform(0.1, 0.3)
+            long_860 += spike_mag
+            long_740 += spike_mag
+            short_860 += spike_mag
+            short_740 += spike_mag
+
+        # ----------------------------
+        # Keep signals valid
+        # ----------------------------
+        min_signal = dark + 0.001
         long_860 = max(long_860, min_signal)
-        short_740 = max(short_740, min_signal)
+        long_740 = max(long_740, min_signal)
         short_860 = max(short_860, min_signal)
+        short_740 = max(short_740, min_signal)
 
-        metadata = (frame_number << 4) | optode_id  # 28 bits frame, 4 bits optode
+        metadata = (frame_number << 4) | optode_id
+
         return struct.pack(
             self.PACKET_FORMAT,
             metadata,
@@ -81,6 +124,7 @@ class Simulator:
             float(short_860),
             float(dark),
         )
+
 
     def _run_loop(self):
         """Call _generate_packet() at sample Hz"""
