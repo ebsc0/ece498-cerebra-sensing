@@ -13,6 +13,8 @@ from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
 
 from config import (
     ACTIVE_OPTODES,
+    GRAPH_Y_MAX,
+    GRAPH_Y_MIN,
     HEADMAP_IMAGE_PATH,
     MAX_PLOT_POINTS,
     OPTODE_COLORS,
@@ -400,6 +402,7 @@ class MainScreen(Screen):
         ax.set_xlabel("Samples (Most Recent)", color=self.theme["axis_text"])
         ax.set_ylabel("Delta Hb (a.u.)", color=self.theme["axis_text"])
         ax.set_title("Hemoglobin Trend (Long - Short)", color=self.theme["text_primary"], fontsize=11)
+        ax.set_ylim(GRAPH_Y_MIN, GRAPH_Y_MAX)
         ax.grid(True, color=self.theme["grid"], linewidth=0.8, alpha=0.9)
         for spine in ax.spines.values():
             spine.set_color(self.theme["axis_border"])
@@ -484,9 +487,13 @@ class MainScreen(Screen):
             self.headmap_colorbar.remove()
             self.headmap_colorbar = None
 
-        if HEADMAP_IMAGE_PATH and os.path.exists(HEADMAP_IMAGE_PATH):
+        resolved_image_path = HEADMAP_IMAGE_PATH
+        if resolved_image_path and not os.path.isabs(resolved_image_path):
+            resolved_image_path = os.path.join(os.path.dirname(__file__), resolved_image_path)
+
+        if resolved_image_path and os.path.exists(resolved_image_path):
             try:
-                img = mpimg.imread(HEADMAP_IMAGE_PATH)
+                img = mpimg.imread(resolved_image_path)
                 self.headmap_ax.imshow(img, extent=(0, 1, 0, 1), aspect="auto", zorder=0)
             except Exception as e:
                 print(f"Warning: Could not load headmap image: {e}")
