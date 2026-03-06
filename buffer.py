@@ -2,9 +2,16 @@ import struct
 import time
 from typing import Dict, Optional, Tuple, NamedTuple
 
+from config import PACKET_FORMAT
+
+
+DEFAULT_PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+
 
 def decode_metadata(packet: bytes) -> Tuple[int, int]:
     """Extract frame number and optode ID from packet metadata."""
+    if len(packet) < 4:
+        raise ValueError("Packet is too short for metadata decode.")
     metadata = struct.unpack('<I', packet[0:4])[0]
     frame = metadata >> 4       # upper 28 bits
     optode = metadata & 0xF     # lower 4 bits
@@ -32,10 +39,12 @@ class Buffer:
         num_optodes: int,
         stale_timeout_ms: int = 2000,
         max_pending_frames: int = 256,
+        packet_size: int = DEFAULT_PACKET_SIZE,
     ):
         self.num_optodes = num_optodes
         self.stale_timeout_ms = stale_timeout_ms
         self.max_pending_frames = max_pending_frames
+        self.packet_size = packet_size
         self._pending: Dict[int, Dict[int, Packet]] = {}  # frame -> {optode: Packet}
         self._start_time_ms: Optional[int] = None  # Set on first packet
         self._dropped_frames = 0
@@ -60,20 +69,33 @@ class Buffer:
                 self._pending.pop(frame_number, None)
                 self._dropped_frames += 1
 
-    def add_packet(self, packet: bytes) -> Optional[CompleteFrame]:
+    def add_packet(self, packet: bytes, packet_timestamp_ms: Optional[int] = None) -> Optional[CompleteFrame]:
         """
         Add a packet to the buffer.
         
         Args:
             packet: Raw packet bytes with uint32 metadata header.
+            packet_timestamp_ms: Optional packet ingress time (monotonic ms).
+                If omitted, uses current wall-clock time.
         
         Returns:
             CompleteFrame if frame is complete, None otherwise.
         """
-        frame, optode = decode_metadata(packet)
+        if len(packet) != self.packet_size:
+            return None
+        try:
+            frame, optode = decode_metadata(packet)
+        except (ValueError, struct.error):
+            return None
+        if optode < 0 or optode >= self.num_optodes:
+            return None
         
         # Auto-initialize start time on first packet (first frame = 0ms)
-        current_time_ms = int(time.time() * 1000)
+        current_time_ms = (
+            int(time.time() * 1000)
+            if packet_timestamp_ms is None
+            else int(packet_timestamp_ms)
+        )
         if self._start_time_ms is None:
             self._start_time_ms = current_time_ms
         
@@ -85,6 +107,10 @@ class Buffer:
             self._pending[frame] = {}
 
         self._pending[frame][optode] = Packet(packet, timestamp_ms)
+        # Enforce overflow after insertion so the cap applies to current packet too.
+        self._evict_stale_and_overflow(timestamp_ms)
+        if frame not in self._pending:
+            return None
 
         # Check if frame is complete
         if len(self._pending[frame]) == self.num_optodes:
