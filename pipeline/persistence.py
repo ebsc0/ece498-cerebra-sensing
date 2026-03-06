@@ -39,14 +39,12 @@ def store_raw_frame(
 
 def store_preprocessed_frame(
     db: DatabaseManager,
-    session_id: int,
     preprocessed: Dict[int, PreprocessedResult],
 ) -> None:
     """Insert per-optode preprocessed samples for one frame."""
     pre_batch = []
     for result in preprocessed.values():
         sample = PreprocessedSample(
-            optode_id=result.optode_id,
             od_nm740_short=result.od_nm740_short,
             od_nm740_long=result.od_nm740_long,
             od_nm860_short=result.od_nm860_short,
@@ -56,8 +54,7 @@ def store_preprocessed_frame(
             hbo_long=result.hbo_long,
             hbr_long=result.hbr_long,
         )
-        pre_batch.append((result.sample_id, result.frame_number, result.timestamp_ms, sample))
+        pre_batch.append((result.sample_id, sample))
 
     if pre_batch:
-        db.insert_preprocessed_samples_batch(session_id, pre_batch)
-
+        db.insert_preprocessed_samples_batch(pre_batch)

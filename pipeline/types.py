@@ -6,6 +6,13 @@ from buffer import CompleteFrame
 from preprocessor import PreprocessedResult
 
 
+class RawPacket(NamedTuple):
+    """Packet envelope with ingress timestamp (monotonic ms) captured at thread1."""
+
+    packet: bytes
+    ingress_timestamp_ms: int
+
+
 class MatchedFrame(NamedTuple):
     """A complete frame plus raw-sample DB IDs keyed by optode."""
 
@@ -28,4 +35,5 @@ class PipelineSummary(NamedTuple):
     captured_frames: int
     processed_frames: int
     dropped_incomplete_frames: int
-    last_frame_hemorrhage_detected: bool
+    session_hemorrhage_detected: bool
+    drain_complete: bool
