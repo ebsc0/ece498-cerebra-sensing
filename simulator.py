@@ -4,6 +4,36 @@ import struct
 import threading
 import time
 from typing import Callable, Optional
+from data_source import DataSource, PacketCallback, SourceEvent, SourceEventCallback
+
+class SimulatorSource(DataSource):
+    """Simulator-backed packet source."""
+
+    def __init__(self, *, num_optodes: int, sample_rate_hz: float):
+        self._simulator = Simulator(num_optodes=num_optodes, sample_rate_hz=sample_rate_hz)
+        self._event_callback: Optional[SourceEventCallback] = None
+
+    def start(
+        self,
+        packet_callback: PacketCallback,
+        event_callback: Optional[SourceEventCallback] = None,
+    ) -> None:
+        self._event_callback = event_callback
+        self._simulator.start(packet_callback)
+        self._emit("connected", "Simulator source started.")
+
+    def stop(self) -> None:
+        was_running = self._simulator.is_running()
+        self._simulator.stop()
+        if was_running:
+            self._emit("stopped", "Simulator source stopped.")
+
+    def is_running(self) -> bool:
+        return self._simulator.is_running()
+
+    def _emit(self, kind: str, message: str) -> None:
+        if self._event_callback:
+            self._event_callback(SourceEvent(kind=kind, message=message))
 
 
 class Simulator:
@@ -116,7 +146,7 @@ class Simulator:
             return
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=1.0)
+            self._thread.join()
         self._running = False
         self._thread = None
 
