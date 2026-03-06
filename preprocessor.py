@@ -129,6 +129,7 @@ class Preprocessor:
         self.dist_long = DISTANCE_LONG
 
         self.low_b, self.low_a, self.sci_b, self.sci_a = _design_filters(self.sample_rate_hz)
+        self.packet_size = struct.calcsize(PACKET_FORMAT)
         self._states: Dict[int, _OptodeState] = {}
 
     def reset(self) -> None:
@@ -321,6 +322,8 @@ class Preprocessor:
         for optode_id, packet in frame.packets.items():
             sample_id = sample_ids.get(optode_id)
             if sample_id is None:
+                continue
+            if len(packet) != self.packet_size:
                 continue
 
             # Unpack packet:
