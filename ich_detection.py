@@ -13,7 +13,7 @@ import numpy as np
 
 ASYMMETRY_THRESHOLD_OD = 0.05
 ASYMMETRY_THRESHOLD_HBT_PERCENT = 0.01
-SLOPE_THRESHOLD = 0.5
+SLOPE_THRESHOLD = 0.005
 PERSISTENCE_RATIO = 0.6
 
 WINDOW_SECONDS = 5
@@ -127,6 +127,8 @@ def detect_ich(
         OD860 = optode_data[optode_id].get("OD_860", 0)
         OD740 = optode_data[optode_id].get("OD_740", 0)
 
+        print("HbO:", HbO, "HbR:", HbR, "HbT:", HbT, "OD860:", OD860)
+
         od860_diff = 0
         od740_diff = 0
         percent_diff = 0
@@ -188,7 +190,7 @@ def detect_ich(
 
         # Required ensemble logic
         if flag_count >= 4:
-            final_flags[optode_id] = "POTENTIAL_ICH"
+            final_flags[optode_id] = "ICH_RISK"
         elif flag_count >= 2:
             final_flags[optode_id] = "ABNORMALITY"
         else:
@@ -204,6 +206,6 @@ def detect_ich(
             "slope": f_slope,
             "persistence": f_persist
         }
-        print("flag:", final_flags, "flag counts", flag_counts, "flag info", detailed_flags)
+        #print("flag:", final_flags, "flag counts", flag_counts, "flag info", detailed_flags)
 
     return final_flags, flag_counts

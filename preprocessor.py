@@ -262,6 +262,18 @@ class Preprocessor:
         filtered_od_740, state.zi_740 = self._apply_lowpass(clean_od_740, state.zi_740)
         filtered_od_860, state.zi_860 = self._apply_lowpass(clean_od_860, state.zi_860)
 
+        # DEBUG: inspect filtering behavior
+        if optode_id == 0:  # only print for one optode to avoid spam
+            print(
+                f"\nOptode {optode_id}"
+                f"\nOD740 raw: {od_long_740:.6f}"
+                f"\nOD740 clean: {clean_od_740:.6f}"
+                f"\nOD740 filtered: {filtered_od_740:.6f}"
+                f"\nOD860 raw: {od_long_860:.6f}"
+                f"\nOD860 clean: {clean_od_860:.6f}"
+                f"\nOD860 filtered: {filtered_od_860:.6f}"
+            )
+
         # MBLL:
         # - short channel from raw short OD
         # - long channel from filtered long OD
@@ -297,6 +309,7 @@ class Preprocessor:
             dark=float(frame["dark"]),
         )
         if processed is None:
+            print("process none 1")
             return None
 
         return {
@@ -335,7 +348,10 @@ class Preprocessor:
                 dark=float(data[5]),
             )
             if processed is None:
+                print("process none 2")
                 continue
+
+            # print(f"HbO from preprocessor:{processed["hbo_long"]}")
 
             results[optode_id] = PreprocessedResult(
                 sample_id=sample_id,
