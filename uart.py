@@ -103,7 +103,6 @@ class UartSource(DataSource):
         self._running = False
         self._serial = None
         self._serial_lock = threading.Lock()
-        self._invalid_packet_count = 0
         self._was_ever_connected = False
 
     def start(
@@ -118,7 +117,6 @@ class UartSource(DataSource):
         self._event_callback = event_callback
         self._stop_event.clear()
         self._framer.reset()
-        self._invalid_packet_count = 0
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         self._running = True
@@ -174,7 +172,8 @@ class UartSource(DataSource):
                     )
 
                 for packet in packets:
-                    self._handle_packet(packet)
+                    if self._packet_callback:
+                        self._packet_callback(packet)
             except Exception as exc:
                 self._emit("disconnected", f"UART read failed: {exc}")
                 self._close_serial()
@@ -188,18 +187,6 @@ class UartSource(DataSource):
 
         self._close_serial()
         self._running = False
-
-    def _handle_packet(self, packet: bytes) -> None:
-        if not self._is_valid_payload(packet):
-            self._invalid_packet_count += 1
-            if self._invalid_packet_count in (1, 10) or self._invalid_packet_count % 100 == 0:
-                self._emit(
-                    "warning",
-                    f"Dropping invalid UART payloads (count={self._invalid_packet_count}).",
-                )
-            return
-        if self._packet_callback:
-            self._packet_callback(packet)
 
     def _open_serial(self):
         try:
