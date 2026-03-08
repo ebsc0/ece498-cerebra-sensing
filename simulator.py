@@ -56,7 +56,9 @@ class Simulator:
         self._running = False
         self._rng = random.Random()
         self._optode_baseline: dict[int, float] = {}
-        self._optode_phase: dict[int, float] = {}
+        self._optode_surface_phase: dict[int, float] = {}
+        self._optode_deep_phase: dict[int, float] = {}
+        self._optode_drift_phase: dict[int, float] = {}
         self._reset_signal_state()
 
     def _reset_signal_state(self) -> None:
@@ -64,29 +66,103 @@ class Simulator:
             optode_id: self._rng.uniform(2500.0, 3500.0)
             for optode_id in self.active_optodes
         }
-        self._optode_phase = {
+        self._optode_surface_phase = {
+            optode_id: self._rng.uniform(0.0, 2.0 * math.pi)
+            for optode_id in self.active_optodes
+        }
+        self._optode_deep_phase = {
+            optode_id: self._rng.uniform(0.0, 2.0 * math.pi)
+            for optode_id in self.active_optodes
+        }
+        self._optode_drift_phase = {
             optode_id: self._rng.uniform(0.0, 2.0 * math.pi)
             for optode_id in self.active_optodes
         }
 
-    def _channel_values(self, optode_id: int, frame_number: int) -> tuple[float, float, float, float, float]:
-        t = frame_number / self.sample_rate_hz if self.sample_rate_hz > 0 else float(frame_number)
-        phase = (2.0 * math.pi * 0.2 * t) + self._optode_phase[optode_id]
-        pulsatile = math.sin(phase)
-        baseline = self._optode_baseline[optode_id]
-
-        far_value = baseline + 30.0 * pulsatile + self._rng.gauss(0.0, 8.0)
-        near_value = (baseline * 0.72) + 12.0 * pulsatile + self._rng.gauss(0.0, 6.0)
+    def _build_diode_values(
+        self,
+        *,
+        baseline: float,
+        near_scale: float,
+        far_scale: float,
+        surface: float,
+        deep: float,
+        drift: float,
+        near_surface_gain: float,
+        far_surface_gain: float,
+        near_deep_gain: float,
+        far_deep_gain: float,
+        near_drift_gain: float,
+        far_drift_gain: float,
+        dark_value: float,
+    ) -> tuple[float, float, float, float]:
+        near_value = (
+            baseline * near_scale
+            + near_surface_gain * surface
+            + near_deep_gain * deep
+            + near_drift_gain * drift
+            + self._rng.gauss(0.0, 6.0)
+        )
+        far_value = (
+            baseline * far_scale
+            + far_surface_gain * surface
+            + far_deep_gain * deep
+            + far_drift_gain * drift
+            + self._rng.gauss(0.0, 8.0)
+        )
         inner_near_value = near_value + 0.35 * (far_value - near_value) + self._rng.gauss(0.0, 3.0)
         inner_far_value = near_value + 0.70 * (far_value - near_value) + self._rng.gauss(0.0, 3.0)
-        dark_value = max(0.5, 8.0 + self._rng.gauss(0.0, 0.8))
 
         min_signal = dark_value + 1.0
         near_value = max(near_value, min_signal)
         inner_near_value = max(inner_near_value, min_signal)
         inner_far_value = max(inner_far_value, min_signal)
         far_value = max(far_value, min_signal)
-        return far_value, inner_far_value, inner_near_value, near_value, dark_value
+        return far_value, inner_far_value, inner_near_value, near_value
+
+    def _channel_values(
+        self,
+        optode_id: int,
+        frame_number: int,
+    ) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float], float]:
+        t = frame_number / self.sample_rate_hz if self.sample_rate_hz > 0 else float(frame_number)
+        baseline = self._optode_baseline[optode_id]
+        surface = math.sin((2.0 * math.pi * 0.70 * t) + self._optode_surface_phase[optode_id])
+        deep = math.sin((2.0 * math.pi * 0.12 * t) + self._optode_deep_phase[optode_id])
+        drift = math.sin((2.0 * math.pi * 0.03 * t) + self._optode_drift_phase[optode_id])
+        dark_value = max(0.5, 8.0 + self._rng.gauss(0.0, 0.8))
+
+        values_740 = self._build_diode_values(
+            baseline=baseline,
+            near_scale=0.74,
+            far_scale=1.00,
+            surface=surface,
+            deep=deep,
+            drift=drift,
+            near_surface_gain=70.0,
+            far_surface_gain=52.0,
+            near_deep_gain=35.0,
+            far_deep_gain=3200.0,
+            near_drift_gain=35.0,
+            far_drift_gain=220.0,
+            dark_value=dark_value,
+        )
+        values_860 = self._build_diode_values(
+            baseline=baseline * 1.03,
+            near_scale=0.73,
+            far_scale=1.01,
+            surface=surface,
+            deep=-deep,
+            drift=drift,
+            near_surface_gain=60.0,
+            far_surface_gain=44.0,
+            near_deep_gain=28.0,
+            far_deep_gain=2800.0,
+            near_drift_gain=28.0,
+            far_drift_gain=180.0,
+            dark_value=dark_value,
+        )
+        return values_740, values_860, dark_value
 
     def _pack_phase_packet(
         self,
@@ -106,15 +182,8 @@ class Simulator:
                 max(0.5, dark_value + self._rng.gauss(0.0, 0.15)),
                 max(0.5, dark_value + self._rng.gauss(0.0, 0.15)),
             )
-        elif phase == PHASE_740:
+        elif phase in (PHASE_740, PHASE_860):
             values = (far_value, inner_far_value, inner_near_value, near_value)
-        elif phase == PHASE_860:
-            values = (
-                far_value * 1.04,
-                inner_far_value * 1.04,
-                inner_near_value * 1.04,
-                near_value * 1.04,
-            )
         else:
             raise ValueError(f"Unsupported phase: {phase}")
 
@@ -128,23 +197,35 @@ class Simulator:
             for optode_id in self.active_optodes:
                 if self._stop_event.is_set():
                     break
-                far_value, inner_far_value, inner_near_value, near_value, dark_value = self._channel_values(
-                    optode_id, frame_number
-                )
-                for phase in (PHASE_740, PHASE_860, PHASE_DARK):
-                    if self._callback:
-                        self._callback(
-                            self._pack_phase_packet(
-                                optode_id,
-                                frame_number,
-                                phase,
-                                far_value,
-                                inner_far_value,
-                                inner_near_value,
-                                near_value,
-                                dark_value,
-                            )
+                values_740, values_860, dark_value = self._channel_values(optode_id, frame_number)
+                if self._callback:
+                    self._callback(
+                        self._pack_phase_packet(
+                            optode_id,
+                            frame_number,
+                            PHASE_740,
+                            *values_740,
+                            dark_value,
                         )
+                    )
+                    self._callback(
+                        self._pack_phase_packet(
+                            optode_id,
+                            frame_number,
+                            PHASE_860,
+                            *values_860,
+                            dark_value,
+                        )
+                    )
+                    self._callback(
+                        self._pack_phase_packet(
+                            optode_id,
+                            frame_number,
+                            PHASE_DARK,
+                            *values_740,
+                            dark_value,
+                        )
+                    )
             frame_number += 1
             time.sleep(interval)
 

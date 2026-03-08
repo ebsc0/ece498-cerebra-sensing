@@ -39,8 +39,8 @@ ICH_OPTODE_PAIRS = {
 # UI settings
 MAX_PLOT_POINTS = 50
 UI_UPDATE_RATE_HZ = 10.0
-GRAPH_Y_MIN = -0.001
-GRAPH_Y_MAX = 0.001
+GRAPH_Y_MIN = -0.0005
+GRAPH_Y_MAX = 0.0005
 
 # Optical parameters for MBLL
 DPF_SHORT = 6.0           # Differential pathlength factor (short channel)
