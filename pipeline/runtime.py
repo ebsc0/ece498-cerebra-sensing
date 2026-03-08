@@ -50,6 +50,9 @@ class PipelineRuntime:
         self._captured_frames = 0
         self._processed_frames = 0
         self._dropped_incomplete_frames = 0
+        self._dropped_raw_packets = 0
+        self._dropped_logical_frames = 0
+        self._dropped_ui_frames = 0
         self._session_hemorrhage_detected = False
         self._last_drain_complete = True
 
@@ -66,6 +69,9 @@ class PipelineRuntime:
             self._captured_frames = 0
             self._processed_frames = 0
             self._dropped_incomplete_frames = 0
+            self._dropped_raw_packets = 0
+            self._dropped_logical_frames = 0
+            self._dropped_ui_frames = 0
             self._session_hemorrhage_detected = False
             self._last_drain_complete = True
 
@@ -74,7 +80,7 @@ class PipelineRuntime:
             db=self.db,
             raw_packet_queue=self.raw_packet_queue,
             logical_frame_queue=self.logical_frame_queue,
-            put_drop_oldest=self._put_drop_oldest,
+            enqueue_logical_frame=self._enqueue_logical_frame,
             put_control=self._put_control,
             on_captured_frame=self._on_captured_frame,
             on_dropped_incomplete_frames=self._on_dropped_incomplete_frames,
@@ -89,7 +95,7 @@ class PipelineRuntime:
             preprocessor=self.preprocessor,
             logical_frame_queue=self.logical_frame_queue,
             preprocessed_queue=self.preprocessed_queue,
-            put_drop_oldest=self._put_drop_oldest,
+            enqueue_ui_frame=self._enqueue_ui_frame,
             on_session_hemorrhage=self._on_session_hemorrhage,
             on_processed_frame=self._on_processed_frame,
             on_error=self._on_worker_error,
@@ -107,7 +113,7 @@ class PipelineRuntime:
 
     def ingest_packet(self, packet: bytes) -> None:
         envelope = RawPacket(packet=packet, ingress_timestamp_ms=time.monotonic_ns() // 1_000_000)
-        self._put_drop_oldest(self.raw_packet_queue, envelope)
+        self._enqueue_raw_packet(envelope)
 
     def drain_ui_results(self) -> list[UiFrameResult]:
         items: list[UiFrameResult] = []
@@ -136,6 +142,9 @@ class PipelineRuntime:
                 captured_frames=self._captured_frames,
                 processed_frames=self._processed_frames,
                 dropped_incomplete_frames=self._dropped_incomplete_frames,
+                dropped_raw_packets=self._dropped_raw_packets,
+                dropped_logical_frames=self._dropped_logical_frames,
+                dropped_ui_frames=self._dropped_ui_frames,
                 session_hemorrhage_detected=self._session_hemorrhage_detected,
                 drain_complete=self._last_drain_complete,
             )
@@ -194,17 +203,56 @@ class PipelineRuntime:
     def _on_worker_error(self, text: str) -> None:
         self._put_drop_oldest(self.error_queue, text)
 
+    def _enqueue_raw_packet(self, envelope: RawPacket) -> None:
+        if self._put_drop_oldest(self.raw_packet_queue, envelope):
+            count = self._record_overflow("raw")
+            if self._should_warn_overflow(count):
+                self._on_worker_error(
+                    f"Warning: raw ingest queue overflow dropped {count} packet(s) total."
+                )
+
+    def _enqueue_logical_frame(self, frame: StoredLogicalFrame) -> None:
+        if self._put_drop_oldest(self.logical_frame_queue, frame):
+            count = self._record_overflow("logical")
+            if self._should_warn_overflow(count):
+                self._on_worker_error(
+                    f"Warning: logical frame queue overflow dropped {count} frame(s) total."
+                )
+
+    def _enqueue_ui_frame(self, result: UiFrameResult) -> None:
+        if self._put_drop_oldest(self.preprocessed_queue, result):
+            self._record_overflow("ui")
+
+    def _record_overflow(self, queue_name: str) -> int:
+        with self._lock:
+            if queue_name == "raw":
+                self._dropped_raw_packets += 1
+                return self._dropped_raw_packets
+            if queue_name == "logical":
+                self._dropped_logical_frames += 1
+                return self._dropped_logical_frames
+            if queue_name == "ui":
+                self._dropped_ui_frames += 1
+                return self._dropped_ui_frames
+        raise ValueError(f"Unsupported overflow queue '{queue_name}'.")
+
     @staticmethod
-    def _put_drop_oldest(q: queue.Queue, item: object) -> None:
+    def _should_warn_overflow(count: int) -> bool:
+        return count == 1 or count % 100 == 0
+
+    @staticmethod
+    def _put_drop_oldest(q: queue.Queue, item: object) -> bool:
+        evicted = False
         while True:
             try:
                 q.put_nowait(item)
-                return
+                return evicted
             except queue.Full:
                 try:
                     q.get_nowait()
                 except queue.Empty:
-                    return
+                    return evicted
+                evicted = True
 
     @staticmethod
     def _put_control(

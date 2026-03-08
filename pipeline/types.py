@@ -35,5 +35,8 @@ class PipelineSummary(NamedTuple):
     captured_frames: int
     processed_frames: int
     dropped_incomplete_frames: int
+    dropped_raw_packets: int
+    dropped_logical_frames: int
+    dropped_ui_frames: int
     session_hemorrhage_detected: bool
     drain_complete: bool

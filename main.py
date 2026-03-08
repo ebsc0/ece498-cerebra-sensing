@@ -214,8 +214,15 @@ class CerebraApp(App):
             f"[{self._timestamp()}] Session stopped (ID: {self.session_id}, "
             f"Duration: {elapsed}, Captured: {summary.captured_frames}, "
             f"Processed: {summary.processed_frames}, "
-            f"Dropped(incomplete): {summary.dropped_incomplete_frames})\n"
+            f"Dropped(incomplete): {summary.dropped_incomplete_frames}, "
+            f"Dropped(raw): {summary.dropped_raw_packets}, "
+            f"Dropped(logical): {summary.dropped_logical_frames}, "
+            f"Dropped(ui): {summary.dropped_ui_frames})\n"
         )
+        if summary.dropped_raw_packets > 0 or summary.dropped_logical_frames > 0:
+            self.screen.append_log(
+                f"[{self._timestamp()}] Warning: session experienced queue overflow; results may be incomplete.\n"
+            )
         if not summary.drain_complete:
             self.screen.append_log(
                 f"[{self._timestamp()}] Warning: pipeline stop timed out; session ended with partial drain.\n"

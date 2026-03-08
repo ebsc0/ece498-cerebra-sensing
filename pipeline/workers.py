@@ -34,7 +34,7 @@ class AssemblyWorker:
         db: DatabaseManager,
         raw_packet_queue: queue.Queue[Optional[RawPacket]],
         logical_frame_queue: queue.Queue[Optional[StoredLogicalFrame]],
-        put_drop_oldest: Callable[[queue.Queue, object], None],
+        enqueue_logical_frame: Callable[[StoredLogicalFrame], None],
         put_control: Callable[[queue.Queue, object], bool],
         on_captured_frame: Callable[[], None],
         on_dropped_incomplete_frames: Callable[[int], None],
@@ -47,7 +47,7 @@ class AssemblyWorker:
         self.db = db
         self.raw_packet_queue = raw_packet_queue
         self.logical_frame_queue = logical_frame_queue
-        self.put_drop_oldest = put_drop_oldest
+        self.enqueue_logical_frame = enqueue_logical_frame
         self.put_control = put_control
         self.on_captured_frame = on_captured_frame
         self.on_dropped_incomplete_frames = on_dropped_incomplete_frames
@@ -89,9 +89,8 @@ class AssemblyWorker:
                 if not sample_ids:
                     continue
 
-                self.put_drop_oldest(
-                    self.logical_frame_queue,
-                    StoredLogicalFrame(frame=assembled_frame, sample_ids=sample_ids),
+                self.enqueue_logical_frame(
+                    StoredLogicalFrame(frame=assembled_frame, sample_ids=sample_ids)
                 )
                 self._last_emitted_frame_number = assembled_frame.frame_number
                 self.on_captured_frame()
@@ -113,7 +112,7 @@ class PreprocessWorker:
         preprocessor: Preprocessor,
         logical_frame_queue: queue.Queue[Optional[StoredLogicalFrame]],
         preprocessed_queue: queue.Queue[UiFrameResult],
-        put_drop_oldest: Callable[[queue.Queue, object], None],
+        enqueue_ui_frame: Callable[[UiFrameResult], None],
         on_session_hemorrhage: Callable[[bool], None],
         on_processed_frame: Callable[[], None],
         on_error: Callable[[str], None],
@@ -127,7 +126,7 @@ class PreprocessWorker:
         self.preprocessor = preprocessor
         self.logical_frame_queue = logical_frame_queue
         self.preprocessed_queue = preprocessed_queue
-        self.put_drop_oldest = put_drop_oldest
+        self.enqueue_ui_frame = enqueue_ui_frame
         self.on_session_hemorrhage = on_session_hemorrhage
         self.on_processed_frame = on_processed_frame
         self.on_error = on_error
@@ -175,14 +174,13 @@ class PreprocessWorker:
                 self.on_session_hemorrhage(self._session_hemorrhage_detected)
                 self.on_processed_frame()
 
-                self.put_drop_oldest(
-                    self.preprocessed_queue,
+                self.enqueue_ui_frame(
                     UiFrameResult(
                         frame=stored_frame.frame,
                         preprocessed=preprocessed,
                         ich_flags=flags,
                         ich_counts=counts,
-                    ),
+                    )
                 )
             except Exception as exc:
                 self.on_error(f"Error in preprocess worker: {exc}")
