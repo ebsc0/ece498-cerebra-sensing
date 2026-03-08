@@ -21,9 +21,6 @@ from config import (
     BUFFER_MAX_PENDING_FRAMES,
     BUFFER_STALE_TIMEOUT_MS,
     DATA_SOURCE,
-    ICH_OPTODE_PAIRS,
-    NUM_OPTODES,
-    PACKET_FORMAT,
     SAMPLE_RATE_HZ,
     UART_AUTO_RECONNECT,
     UART_BAUDRATE,
@@ -31,6 +28,7 @@ from config import (
     UART_READ_CHUNK_SIZE,
     UART_RECONNECT_INITIAL_S,
     UART_RECONNECT_MAX_S,
+    UART_SYNC_WORD,
     UART_TIMEOUT_S,
     UI_UPDATE_RATE_HZ,
 )
@@ -59,11 +57,8 @@ class CerebraApp(App):
         self.db.connect()
         self.session_id = None
 
-        # Session timing/counters
+        # Session timing
         self.session_start_time = None
-        self.captured_frame_count = 0
-        self.processed_frame_count = 0
-        self.rendered_frame_count = 0
         self._last_error_log_time = 0.0
 
         # Processing runtime
@@ -71,10 +66,8 @@ class CerebraApp(App):
         self.pipeline = PipelineRuntime(
             db=self.db,
             preprocessor=self.preprocessor,
-            num_optodes=NUM_OPTODES,
             stale_timeout_ms=BUFFER_STALE_TIMEOUT_MS,
             max_pending_frames=BUFFER_MAX_PENDING_FRAMES,
-            packet_format=PACKET_FORMAT,
             active_optodes=ACTIVE_OPTODES,
         )
 
@@ -91,15 +84,15 @@ class CerebraApp(App):
     @staticmethod
     def _build_data_source() -> DataSource:
         if DATA_SOURCE == "simulator":
-            return SimulatorSource(num_optodes=NUM_OPTODES, sample_rate_hz=SAMPLE_RATE_HZ)
+            return SimulatorSource(active_optodes=ACTIVE_OPTODES, sample_rate_hz=SAMPLE_RATE_HZ)
         if DATA_SOURCE == "uart":
             return UartSource(
                 port=UART_PORT,
                 baudrate=UART_BAUDRATE,
-                packet_format=PACKET_FORMAT,
                 active_optodes=ACTIVE_OPTODES,
                 timeout_s=UART_TIMEOUT_S,
                 read_chunk_size=UART_READ_CHUNK_SIZE,
+                sync_word=UART_SYNC_WORD,
                 auto_reconnect=UART_AUTO_RECONNECT,
                 reconnect_initial_s=UART_RECONNECT_INITIAL_S,
                 reconnect_max_s=UART_RECONNECT_MAX_S,
@@ -137,6 +130,18 @@ class CerebraApp(App):
             return 0
         return max(0, int((time.time() - self.session_start_time) * 1000))
 
+    def _reset_to_idle(self, detail_text: str) -> None:
+        self.pipeline.clear_ui_results()
+        self.session_id = None
+        self.session_start_time = None
+        self.screen.update_session_info(
+            session_id=None,
+            elapsed_str="--:--:--",
+            captured_count=0,
+            processed_count=0,
+        )
+        self.screen.set_idle_state(detail_text)
+
     def start_collection(self):
         """Start data collection and create new session."""
         # Ensure source is stopped before starting a fresh session.
@@ -146,17 +151,14 @@ class CerebraApp(App):
         # Reset algorithmic history.
         reset_history()
 
-        # Reset session tracking
+        # Reset session timing
         self.session_start_time = time.time()
-        self.captured_frame_count = 0
-        self.processed_frame_count = 0
-        self.rendered_frame_count = 0
 
         try:
             # Create new session
             self.session_id = self.db.create_session(
                 sample_rate_hz=SAMPLE_RATE_HZ,
-                num_optodes=NUM_OPTODES,
+                num_optodes=len(ACTIVE_OPTODES),
             )
 
             # Update session info in UI
@@ -173,11 +175,13 @@ class CerebraApp(App):
             # Start pipeline workers, then source ingestion.
             self.pipeline.start(self.session_id)
             self.source.start(self.pipeline.ingest_packet, self._on_source_event)
+            self.screen.set_session_active_state()
 
         except Exception as exc:
             self._log_error_throttled(f"[{self._timestamp()}] Startup error: {exc}\n")
             if self.source.is_running():
                 self.source.stop()
+            self.pipeline.stop(timeout_s=2.0)
 
             if self.session_id:
                 try:
@@ -187,32 +191,17 @@ class CerebraApp(App):
                         f"[{self._timestamp()}] Startup rollback DB cleanup error: {db_exc}\n"
                     )
 
-            self.pipeline.clear_ui_results()
-            self.session_id = None
-            self.session_start_time = None
-            self.captured_frame_count = 0
-            self.processed_frame_count = 0
-            self.rendered_frame_count = 0
-            self.screen.update_session_info(
-                session_id=None,
-                elapsed_str="--:--:--",
-                captured_count=0,
-                processed_count=0,
-            )
-            self.screen.start_btn.disabled = False
-            self.screen.stop_btn.disabled = True
+            self._reset_to_idle("Monitoring failed to start.")
 
     def stop_collection(self):
         """Stop data collection and end session."""
         self.source.stop()
 
         if not self.session_id:
+            self._reset_to_idle("Acquisition stopped.")
             return
 
         summary = self.pipeline.stop()
-        self.captured_frame_count = summary.captured_frames
-        self.processed_frame_count = summary.processed_frames
-        self.pipeline.clear_ui_results()
         try:
             self.db.set_hemorrhage_result(self.session_id, summary.session_hemorrhage_detected)
             self.db.end_session(self.session_id, self._elapsed_ms())
@@ -223,8 +212,8 @@ class CerebraApp(App):
         elapsed = self._elapsed_time_str()
         self.screen.append_log(
             f"[{self._timestamp()}] Session stopped (ID: {self.session_id}, "
-            f"Duration: {elapsed}, Captured: {self.captured_frame_count}, "
-            f"Processed: {self.processed_frame_count}, "
+            f"Duration: {elapsed}, Captured: {summary.captured_frames}, "
+            f"Processed: {summary.processed_frames}, "
             f"Dropped(incomplete): {summary.dropped_incomplete_frames})\n"
         )
         if not summary.drain_complete:
@@ -232,14 +221,7 @@ class CerebraApp(App):
                 f"[{self._timestamp()}] Warning: pipeline stop timed out; session ended with partial drain.\n"
             )
 
-        self.session_id = None
-        self.session_start_time = None
-        self.screen.update_session_info(
-            session_id=None,
-            elapsed_str="--:--:--",
-            captured_count=0,
-            processed_count=0,
-        )
+        self._reset_to_idle("Acquisition stopped.")
 
     def _update_ui(self, dt):
         """Poll pipeline output and update UI."""
@@ -247,13 +229,6 @@ class CerebraApp(App):
             self._log_error_throttled(f"[{self._timestamp()}] {err}\n")
 
         if not self.session_id:
-            self.pipeline.clear_ui_results()
-            self.screen.update_session_info(
-                session_id=None,
-                elapsed_str="--:--:--",
-                captured_count=0,
-                processed_count=0,
-            )
             return
 
         pending = self.pipeline.drain_ui_results()
@@ -261,28 +236,18 @@ class CerebraApp(App):
             # High-rate streams can produce many frames per UI tick. Coalesce to
             # the latest frame so rendering stays responsive.
             latest = pending[-1]
-            self.rendered_frame_count += len(pending)
 
             # Update graph and ICH status using most recent processed frame only.
             self.screen.update_graph(latest.preprocessed)
             self.screen.update_ich_status(latest.ich_flags, latest.ich_counts)
 
-            # Keep logs bounded at higher rates.
-            if self.rendered_frame_count % 100 == 0:
-                self.screen.append_log(
-                    f"[{self._timestamp()}] Frame {latest.frame.frame_number} @ "
-                    f"{latest.frame.timestamp_ms}ms\n"
-                )
-
         # Update session info (always, to keep timer running)
         summary = self.pipeline.get_summary()
-        self.captured_frame_count = summary.captured_frames
-        self.processed_frame_count = summary.processed_frames
         self.screen.update_session_info(
             session_id=self.session_id,
             elapsed_str=self._elapsed_time_str(),
-            captured_count=self.captured_frame_count,
-            processed_count=self.processed_frame_count,
+            captured_count=summary.captured_frames,
+            processed_count=summary.processed_frames,
         )
 
     def _log_error_throttled(self, text: str, interval_s: float = 2.0):

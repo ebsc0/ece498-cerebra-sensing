@@ -696,45 +696,47 @@ class MainScreen(Screen):
             self.session_info_label.text = "SESSION: -- | --:--:--"
             self.stream_state_label.text = "Status: Idle | Captured: 0 | Processed: 0"
 
-    # -------------------------------------------------------------------------
-    # Button Handlers
-    # -------------------------------------------------------------------------
-
-    def _on_start_pressed(self, _instance):
-        self.start_btn.disabled = True
-        self.stop_btn.disabled = False
-
+    def _reset_runtime_views(self):
         self.hbo_data.clear()
         self.hbr_data.clear()
         self.current_hbo.clear()
         self.current_hbr.clear()
         self.ich_flags.clear()
-
         self._init_graph_plot()
         self._init_head_map()
         self._refresh_readouts()
 
-        self.ich_status_label.text = "ICH Status: Monitoring"
-        self.ich_detail_label.text = "Acquisition started. Monitoring incoming data."
-        self._set_alert_panel_style(
-            self.theme["status_monitor_bg"],
-            self.theme["status_monitor_border"],
-        )
-
-        if self.on_start_callback:
-            self.on_start_callback()
-
-    def _on_stop_pressed(self, _instance):
-        self.start_btn.disabled = False
-        self.stop_btn.disabled = True
-
-        self.ich_status_label.text = "ICH Status: Idle"
-        self.ich_detail_label.text = "Acquisition stopped."
+    def set_session_active_state(self):
+        self.start_btn.disabled = True
+        self.stop_btn.disabled = False
+        self._reset_runtime_views()
+        self.ich_status_label.text = "ICH Status: Baseline / Warmup"
+        self.ich_detail_label.text = "Collecting baseline before reliable detection."
         self._set_alert_panel_style(
             self.theme["status_idle_bg"],
             self.theme["status_idle_border"],
         )
 
+    def set_idle_state(self, detail_text: str = "No active monitoring session."):
+        self.start_btn.disabled = False
+        self.stop_btn.disabled = True
+        self._reset_runtime_views()
+        self.ich_status_label.text = "ICH Status: Idle"
+        self.ich_detail_label.text = detail_text
+        self._set_alert_panel_style(
+            self.theme["status_idle_bg"],
+            self.theme["status_idle_border"],
+        )
+
+    # -------------------------------------------------------------------------
+    # Button Handlers
+    # -------------------------------------------------------------------------
+
+    def _on_start_pressed(self, _instance):
+        if self.on_start_callback:
+            self.on_start_callback()
+
+    def _on_stop_pressed(self, _instance):
         if self.on_stop_callback:
             self.on_stop_callback()
 
@@ -747,8 +749,3 @@ class MainScreen(Screen):
         self._log_lines.extend(text.splitlines(keepends=True))
         self.log_label.text = "".join(self._log_lines)
         self._log_scroll.scroll_y = 0
-
-    def clear_log(self):
-        """Clear the event log."""
-        self._log_lines.clear()
-        self.log_label.text = ""
