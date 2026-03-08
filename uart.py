@@ -1,37 +1,29 @@
-"""UART-backed DataSource with binary stream framing and reconnect handling."""
+"""UART-backed DataSource with sync-word framing and reconnect handling."""
 
-import math
-import struct
 import threading
 from typing import Callable, Optional, Sequence
 
+from config import UART_SYNC_WORD
 from data_source import DataSource, PacketCallback, SourceEvent, SourceEventCallback
+from packets import PACKET_SIZE, decode_packet
 
 
 class _PacketFramer:
-    """Incrementally extracts fixed-size payload packets from a byte stream."""
+    """Incrementally extracts sync-prefixed payload packets from a byte stream."""
 
     def __init__(
         self,
         *,
         payload_size: int,
         sync_word: bytes,
-        checksum_mode: str,
         payload_validator: Optional[Callable[[bytes], bool]] = None,
     ):
         self.payload_size = max(1, int(payload_size))
         self.sync_word = bytes(sync_word)
-        self.checksum_mode = checksum_mode
+        if not self.sync_word:
+            raise ValueError("UART sync framing requires a non-empty sync_word")
         self.payload_validator = payload_validator
         self._buffer = bytearray()
-
-    @property
-    def _checksum_size(self) -> int:
-        if self.checksum_mode == "none":
-            return 0
-        if self.checksum_mode == "sum8":
-            return 1
-        raise ValueError(f"Unsupported checksum mode: {self.checksum_mode}")
 
     def reset(self) -> None:
         self._buffer.clear()
@@ -39,63 +31,38 @@ class _PacketFramer:
     def feed(self, data: bytes) -> tuple[list[bytes], int]:
         self._buffer.extend(data)
         packets: list[bytes] = []
-        dropped_candidates = 0
-        checksum_size = self._checksum_size
+        dropped_bytes = 0
+        minimum_needed = len(self.sync_word) + self.payload_size
 
-        if self.sync_word:
-            minimum_needed = len(self.sync_word) + self.payload_size + checksum_size
-            while True:
-                sync_index = self._buffer.find(self.sync_word)
-                if sync_index < 0:
-                    keep = max(0, len(self.sync_word) - 1)
-                    if keep > 0 and len(self._buffer) > keep:
-                        del self._buffer[:-keep]
-                    elif keep == 0:
-                        self._buffer.clear()
-                    break
+        while True:
+            sync_index = self._buffer.find(self.sync_word)
+            if sync_index < 0:
+                keep = max(0, len(self.sync_word) - 1)
+                discard = max(0, len(self._buffer) - keep)
+                if discard:
+                    dropped_bytes += discard
+                    del self._buffer[:discard]
+                break
 
-                if sync_index > 0:
-                    del self._buffer[:sync_index]
+            if sync_index > 0:
+                dropped_bytes += sync_index
+                del self._buffer[:sync_index]
 
-                if len(self._buffer) < minimum_needed:
-                    break
+            if len(self._buffer) < minimum_needed:
+                break
 
-                payload_start = len(self.sync_word)
-                payload_end = payload_start + self.payload_size
-                payload = bytes(self._buffer[payload_start:payload_end])
-                if checksum_size == 1:
-                    observed = self._buffer[payload_end]
-                    expected = sum(payload) & 0xFF
-                    if observed != expected:
-                        dropped_candidates += 1
-                        del self._buffer[0]
-                        continue
-                if self.payload_validator and not self.payload_validator(payload):
-                    dropped_candidates += 1
-                    del self._buffer[0]
-                    continue
+            payload_start = len(self.sync_word)
+            payload_end = payload_start + self.payload_size
+            payload = bytes(self._buffer[payload_start:payload_end])
+            if self.payload_validator and not self.payload_validator(payload):
+                dropped_bytes += 1
+                del self._buffer[0]
+                continue
 
-                packets.append(payload)
-                del self._buffer[:minimum_needed]
-        else:
-            wire_size = self.payload_size + checksum_size
-            while len(self._buffer) >= wire_size:
-                payload = bytes(self._buffer[:self.payload_size])
-                if checksum_size == 1:
-                    observed = self._buffer[self.payload_size]
-                    expected = sum(payload) & 0xFF
-                    if observed != expected:
-                        dropped_candidates += 1
-                        del self._buffer[:1]
-                        continue
-                if self.payload_validator and not self.payload_validator(payload):
-                    dropped_candidates += 1
-                    del self._buffer[:1]
-                    continue
-                packets.append(payload)
-                del self._buffer[:wire_size]
+            packets.append(payload)
+            del self._buffer[:minimum_needed]
 
-        return packets, dropped_candidates
+        return packets, dropped_bytes
 
 
 class UartSource(DataSource):
@@ -106,20 +73,17 @@ class UartSource(DataSource):
         *,
         port: str,
         baudrate: int,
-        packet_format: str,
         active_optodes: Sequence[int],
         timeout_s: float = 0.1,
         read_chunk_size: int = 256,
-        sync_word: bytes = b"",
-        checksum_mode: str = "none",
+        sync_word: bytes = UART_SYNC_WORD,
         auto_reconnect: bool = True,
         reconnect_initial_s: float = 0.5,
         reconnect_max_s: float = 5.0,
     ):
         self.port = port
         self.baudrate = int(baudrate)
-        self.packet_format = packet_format
-        self.packet_size = struct.calcsize(packet_format)
+        self.packet_size = PACKET_SIZE
         self.active_optodes = set(int(x) for x in active_optodes)
         self.timeout_s = max(0.01, float(timeout_s))
         self.read_chunk_size = max(1, int(read_chunk_size))
@@ -130,8 +94,7 @@ class UartSource(DataSource):
         self._framer = _PacketFramer(
             payload_size=self.packet_size,
             sync_word=sync_word,
-            checksum_mode=checksum_mode,
-            payload_validator=self._is_plausible_payload,
+            payload_validator=self._is_valid_payload,
         )
         self._packet_callback: Optional[PacketCallback] = None
         self._event_callback: Optional[SourceEventCallback] = None
@@ -207,7 +170,7 @@ class UartSource(DataSource):
                 if dropped_candidates > 0:
                     self._emit(
                         "warning",
-                        f"Dropped {dropped_candidates} UART byte(s)/candidate packet(s) while re-aligning stream.",
+                        f"Dropped {dropped_candidates} UART byte(s) while re-aligning stream.",
                     )
 
                 for packet in packets:
@@ -267,21 +230,14 @@ class UartSource(DataSource):
         if len(packet) != self.packet_size:
             return False
         try:
-            metadata, long740, long860, short740, short860, dark = struct.unpack(self.packet_format, packet)
-        except struct.error:
+            decoded = decode_packet(packet, timestamp_ms=0)
+        except ValueError:
             return False
-        optode = metadata & 0xF
-        if optode not in self.active_optodes:
+        if decoded.optode_id not in self.active_optodes:
             return False
-        values = (long740, long860, short740, short860, dark)
-        if not all(math.isfinite(v) for v in values):
-            return False
-        if any(abs(v) > 1e6 for v in values):
+        if any(abs(value) > 1e6 for value in (decoded.d0, decoded.d1, decoded.d2, decoded.d3)):
             return False
         return True
-
-    def _is_plausible_payload(self, packet: bytes) -> bool:
-        return self._is_valid_payload(packet)
 
     def _emit(self, kind: str, message: str) -> None:
         if self._event_callback:

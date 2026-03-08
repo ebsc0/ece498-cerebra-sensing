@@ -2,7 +2,7 @@
 
 from typing import Dict, NamedTuple
 
-from buffer import CompleteFrame
+from packets import AssembledFrame
 from preprocessor import PreprocessedResult
 
 
@@ -13,17 +13,17 @@ class RawPacket(NamedTuple):
     ingress_timestamp_ms: int
 
 
-class MatchedFrame(NamedTuple):
-    """A complete frame plus raw-sample DB IDs keyed by optode."""
+class StoredLogicalFrame(NamedTuple):
+    """A complete logical frame plus logical-sample DB IDs keyed by optode."""
 
-    frame: CompleteFrame
+    frame: AssembledFrame
     sample_ids: Dict[int, int]
 
 
 class UiFrameResult(NamedTuple):
     """Per-frame data consumed by the UI update loop."""
 
-    frame: CompleteFrame
+    frame: AssembledFrame
     preprocessed: Dict[int, PreprocessedResult]
     ich_flags: Dict[int, bool]
     ich_counts: Dict[int, int]

@@ -2,21 +2,18 @@
 
 # Optode configuration
 TOTAL_OPTODES = 16        # Hardware capacity (for head map display)
-NUM_OPTODES = 2           # Currently active optodes (for simulator)
 ACTIVE_OPTODES = [0, 1]   # Which of the 16 are connected
 SAMPLE_RATE_HZ = 34.0
 
-# Packet format
-PACKET_FORMAT = '<I5f'  # uint32 metadata + 5 floats
-
 # Source selection
-DATA_SOURCE = "uart"  # "simulator" or "uart"
+DATA_SOURCE = "simulator"  # "simulator" or "uart"
 
 # UART source settings (used when DATA_SOURCE == "uart")
 UART_PORT = "/dev/cu.usbmodem1103"
 UART_BAUDRATE = 115200
 UART_TIMEOUT_S = 0.1
 UART_READ_CHUNK_SIZE = 256
+UART_SYNC_WORD = b"\xA5\x5A"
 UART_AUTO_RECONNECT = True
 UART_RECONNECT_INITIAL_S = 0.5
 UART_RECONNECT_MAX_S = 5.0
@@ -42,8 +39,8 @@ ICH_OPTODE_PAIRS = {
 # UI settings
 MAX_PLOT_POINTS = 50
 UI_UPDATE_RATE_HZ = 10.0
-GRAPH_Y_MIN = -0.05
-GRAPH_Y_MAX = 0.05
+GRAPH_Y_MIN = -0.001
+GRAPH_Y_MAX = 0.001
 
 # Optical parameters for MBLL
 DPF_SHORT = 6.0           # Differential pathlength factor (short channel)

@@ -1,10 +1,12 @@
 """Worker implementations for the streaming acquisition pipeline."""
 
+from __future__ import annotations
+
 from collections import deque
 import queue
 from typing import Callable, Deque, Dict, Optional, Sequence
 
-from buffer import Buffer
+from buffer import PhaseFrameBuffer
 from config import (
     ACTIVE_OPTODES,
     BUFFER_MAX_PENDING_FRAMES,
@@ -12,20 +14,18 @@ from config import (
     ICH_SESSION_MIN_FRAMES,
     ICH_SESSION_PERSISTENCE_RATIO,
     ICH_SESSION_WINDOW_SECONDS,
-    NUM_OPTODES,
-    PACKET_FORMAT,
     SAMPLE_RATE_HZ,
 )
 from database.database import DatabaseManager
 from ich_detection import detect_ich
 from preprocessor import PreprocessedResult, Preprocessor
 
-from pipeline.persistence import store_preprocessed_frame, store_raw_frame
-from pipeline.types import MatchedFrame, RawPacket, UiFrameResult
+from pipeline.persistence import store_assembled_frame, store_preprocessed_frame
+from pipeline.types import RawPacket, StoredLogicalFrame, UiFrameResult
 
 
-class FrameWorker:
-    """Thread2: build complete frames and write raw samples."""
+class AssemblyWorker:
+    """Thread2: assemble phase-complete frames and persist raw/logical samples."""
 
     def __init__(
         self,
@@ -33,35 +33,33 @@ class FrameWorker:
         session_id: int,
         db: DatabaseManager,
         raw_packet_queue: queue.Queue[Optional[RawPacket]],
-        matched_frame_queue: queue.Queue[Optional[MatchedFrame]],
+        logical_frame_queue: queue.Queue[Optional[StoredLogicalFrame]],
         put_drop_oldest: Callable[[queue.Queue, object], None],
         put_control: Callable[[queue.Queue, object], bool],
         on_captured_frame: Callable[[], None],
         on_dropped_incomplete_frames: Callable[[int], None],
         on_error: Callable[[str], None],
-        num_optodes: int = NUM_OPTODES,
+        active_optodes: Optional[Sequence[int]] = None,
         stale_timeout_ms: int = BUFFER_STALE_TIMEOUT_MS,
         max_pending_frames: int = BUFFER_MAX_PENDING_FRAMES,
-        packet_format: str = PACKET_FORMAT,
     ):
         self.session_id = session_id
         self.db = db
         self.raw_packet_queue = raw_packet_queue
-        self.matched_frame_queue = matched_frame_queue
+        self.logical_frame_queue = logical_frame_queue
         self.put_drop_oldest = put_drop_oldest
         self.put_control = put_control
         self.on_captured_frame = on_captured_frame
         self.on_dropped_incomplete_frames = on_dropped_incomplete_frames
         self.on_error = on_error
-        self.num_optodes = num_optodes
+        self.active_optodes = list(active_optodes) if active_optodes is not None else list(ACTIVE_OPTODES)
         self.stale_timeout_ms = stale_timeout_ms
         self.max_pending_frames = max_pending_frames
-        self.packet_format = packet_format
         self._last_emitted_frame_number = -1
 
     def run(self) -> None:
-        frame_buffer = Buffer(
-            num_optodes=self.num_optodes,
+        frame_buffer = PhaseFrameBuffer(
+            active_optodes=self.active_optodes,
             stale_timeout_ms=self.stale_timeout_ms,
             max_pending_frames=self.max_pending_frames,
         )
@@ -72,43 +70,40 @@ class FrameWorker:
                 break
 
             try:
-                complete_frame = frame_buffer.add_packet(packet.packet, packet.ingress_timestamp_ms)
-                if not complete_frame:
+                assembled_frame = frame_buffer.add_packet(packet.packet, packet.ingress_timestamp_ms)
+                if not assembled_frame:
                     continue
 
-                # Preserve strict ordering for downstream temporal algorithms.
-                if complete_frame.frame_number <= self._last_emitted_frame_number:
+                if assembled_frame.frame_number <= self._last_emitted_frame_number:
                     self.on_error(
                         "Dropped late complete frame "
-                        f"{complete_frame.frame_number} (last={self._last_emitted_frame_number})."
+                        f"{assembled_frame.frame_number} (last={self._last_emitted_frame_number})."
                     )
                     continue
 
-                sample_ids = store_raw_frame(
+                sample_ids = store_assembled_frame(
                     db=self.db,
                     session_id=self.session_id,
-                    frame=complete_frame,
-                    packet_format=self.packet_format,
+                    frame=assembled_frame,
                 )
                 if not sample_ids:
                     continue
 
                 self.put_drop_oldest(
-                    self.matched_frame_queue,
-                    MatchedFrame(frame=complete_frame, sample_ids=sample_ids),
+                    self.logical_frame_queue,
+                    StoredLogicalFrame(frame=assembled_frame, sample_ids=sample_ids),
                 )
-                self._last_emitted_frame_number = complete_frame.frame_number
+                self._last_emitted_frame_number = assembled_frame.frame_number
                 self.on_captured_frame()
             except Exception as exc:
-                self.on_error(f"Error in frame worker: {exc}")
+                self.on_error(f"Error in assembly worker: {exc}")
 
         self.on_dropped_incomplete_frames(frame_buffer.dropped_frames())
-        # Unblock downstream stage after all matched frames are emitted.
-        self.put_control(self.matched_frame_queue, None)
+        self.put_control(self.logical_frame_queue, None)
 
 
 class PreprocessWorker:
-    """Thread3: preprocess complete frames, run ICH, and write processed rows."""
+    """Thread3: preprocess logical frames, run ICH, and write processed rows."""
 
     def __init__(
         self,
@@ -116,7 +111,7 @@ class PreprocessWorker:
         session_id: int,
         db: DatabaseManager,
         preprocessor: Preprocessor,
-        matched_frame_queue: queue.Queue[Optional[MatchedFrame]],
+        logical_frame_queue: queue.Queue[Optional[StoredLogicalFrame]],
         preprocessed_queue: queue.Queue[UiFrameResult],
         put_drop_oldest: Callable[[queue.Queue, object], None],
         on_session_hemorrhage: Callable[[bool], None],
@@ -130,13 +125,13 @@ class PreprocessWorker:
         self.session_id = session_id
         self.db = db
         self.preprocessor = preprocessor
-        self.matched_frame_queue = matched_frame_queue
+        self.logical_frame_queue = logical_frame_queue
         self.preprocessed_queue = preprocessed_queue
         self.put_drop_oldest = put_drop_oldest
         self.on_session_hemorrhage = on_session_hemorrhage
         self.on_processed_frame = on_processed_frame
         self.on_error = on_error
-        self.active_optodes = list(active_optodes) if active_optodes is not None else ACTIVE_OPTODES
+        self.active_optodes = list(active_optodes) if active_optodes is not None else list(ACTIVE_OPTODES)
         self.session_window_frames = max(1, int(session_window_frames))
         self.session_persistence_ratio = float(session_persistence_ratio)
         self.session_min_frames = max(1, min(int(session_min_frames), self.session_window_frames))
@@ -157,19 +152,16 @@ class PreprocessWorker:
 
     def run(self) -> None:
         while True:
-            matched = self.matched_frame_queue.get()
-            if matched is None:
+            stored_frame = self.logical_frame_queue.get()
+            if stored_frame is None:
                 break
 
             try:
-                preprocessed = self.preprocessor.process_frame(matched.frame, matched.sample_ids)
+                preprocessed = self.preprocessor.process_frame(stored_frame.frame, stored_frame.sample_ids)
                 if not preprocessed:
                     continue
 
-                store_preprocessed_frame(
-                    db=self.db,
-                    preprocessed=preprocessed,
-                )
+                store_preprocessed_frame(db=self.db, preprocessed=preprocessed)
                 ich_data = self._prepare_ich_data(preprocessed)
                 flags, counts = detect_ich(ich_data, self.active_optodes)
                 frame_flagged = any(flags.values()) if flags else False
@@ -186,7 +178,7 @@ class PreprocessWorker:
                 self.put_drop_oldest(
                     self.preprocessed_queue,
                     UiFrameResult(
-                        frame=matched.frame,
+                        frame=stored_frame.frame,
                         preprocessed=preprocessed,
                         ich_flags=flags,
                         ich_counts=counts,

@@ -1,60 +1,41 @@
-import struct
+"""Phase-aware packet buffer and frame assembly."""
+
+from __future__ import annotations
+
 import time
-from typing import Dict, Optional, Tuple, NamedTuple
+from typing import Dict, Iterable, Optional
 
-from config import PACKET_FORMAT
-
-
-DEFAULT_PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+from config import ACTIVE_OPTODES
+from packets import AssembledFrame, PACKET_SIZE, PhasePacket, VALID_PHASES, decode_packet, reconstruct_logical_sample
 
 
-def decode_metadata(packet: bytes) -> Tuple[int, int]:
-    """Extract frame number and optode ID from packet metadata."""
-    if len(packet) < 4:
-        raise ValueError("Packet is too short for metadata decode.")
-    metadata = struct.unpack('<I', packet[0:4])[0]
-    frame = metadata >> 4       # upper 28 bits
-    optode = metadata & 0xF     # lower 4 bits
-    return frame, optode
-
-
-class Packet(NamedTuple):
-    """Packet with timestamp added at buffer insertion time."""
-    packet: bytes
-    timestamp_ms: int
-
-
-class CompleteFrame(NamedTuple):
-    """Complete frame with all optode packets."""
-    frame_number: int
-    timestamp_ms: int
-    packets: Dict[int, bytes]  # {optode_id: packet_bytes}
-
-
-class Buffer:
-    """Buffers packets and groups them by frame number."""
+class PhaseFrameBuffer:
+    """Buffers phase packets and emits completed logical frames."""
 
     def __init__(
         self,
-        num_optodes: int,
+        active_optodes: Optional[Iterable[int]] = None,
         stale_timeout_ms: int = 2000,
         max_pending_frames: int = 256,
-        packet_size: int = DEFAULT_PACKET_SIZE,
     ):
-        self.num_optodes = num_optodes
-        self.stale_timeout_ms = stale_timeout_ms
-        self.max_pending_frames = max_pending_frames
-        self.packet_size = packet_size
-        self._pending: Dict[int, Dict[int, Packet]] = {}  # frame -> {optode: Packet}
-        self._start_time_ms: Optional[int] = None  # Set on first packet
+        source_optodes = ACTIVE_OPTODES if active_optodes is None else active_optodes
+        self.active_optodes = tuple(int(optode_id) for optode_id in source_optodes)
+        self._active_optode_set = set(self.active_optodes)
+        self.stale_timeout_ms = int(stale_timeout_ms)
+        self.max_pending_frames = int(max_pending_frames)
+        self._pending: Dict[int, Dict[int, Dict[int, PhasePacket]]] = {}
+        self._start_time_ms: Optional[int] = None
         self._dropped_frames = 0
 
-    def _evict_stale_and_overflow(self, current_timestamp_ms: int):
-        """Evict stale or excessive pending frames to prevent unbounded growth."""
+    def _evict_stale_and_overflow(self, current_timestamp_ms: int) -> None:
         if self._pending:
             stale_frames = []
-            for frame_number, packets in self._pending.items():
-                oldest_ts = min(tp.timestamp_ms for tp in packets.values())
+            for frame_number, per_optode in self._pending.items():
+                oldest_ts = min(
+                    phase_packet.timestamp_ms
+                    for optode_phases in per_optode.values()
+                    for phase_packet in optode_phases.values()
+                )
                 if current_timestamp_ms - oldest_ts > self.stale_timeout_ms:
                     stale_frames.append(frame_number)
 
@@ -63,103 +44,72 @@ class Buffer:
                 self._dropped_frames += 1
 
         if len(self._pending) > self.max_pending_frames:
-            # Drop oldest frame numbers first.
             overflow = len(self._pending) - self.max_pending_frames
             for frame_number in sorted(self._pending.keys())[:overflow]:
                 self._pending.pop(frame_number, None)
                 self._dropped_frames += 1
 
-    def add_packet(self, packet: bytes, packet_timestamp_ms: Optional[int] = None) -> Optional[CompleteFrame]:
-        """
-        Add a packet to the buffer.
-        
-        Args:
-            packet: Raw packet bytes with uint32 metadata header.
-            packet_timestamp_ms: Optional packet ingress time (monotonic ms).
-                If omitted, uses current wall-clock time.
-        
-        Returns:
-            CompleteFrame if frame is complete, None otherwise.
-        """
-        if len(packet) != self.packet_size:
+    def add_packet(
+        self,
+        packet: bytes,
+        packet_timestamp_ms: Optional[int] = None,
+    ) -> Optional[AssembledFrame]:
+        if len(packet) != PACKET_SIZE:
             return None
-        try:
-            frame, optode = decode_metadata(packet)
-        except (ValueError, struct.error):
-            return None
-        if optode < 0 or optode >= self.num_optodes:
-            return None
-        
-        # Auto-initialize start time on first packet (first frame = 0ms)
-        current_time_ms = (
-            int(time.time() * 1000)
-            if packet_timestamp_ms is None
-            else int(packet_timestamp_ms)
-        )
+
+        current_time_ms = int(time.time() * 1000) if packet_timestamp_ms is None else int(packet_timestamp_ms)
         if self._start_time_ms is None:
             self._start_time_ms = current_time_ms
-        
-        # Relative timestamp from session start
-        timestamp_ms = current_time_ms - self._start_time_ms
-        self._evict_stale_and_overflow(timestamp_ms)
+        relative_timestamp_ms = current_time_ms - self._start_time_ms
 
-        if frame not in self._pending:
-            self._pending[frame] = {}
-
-        self._pending[frame][optode] = Packet(packet, timestamp_ms)
-        # Enforce overflow after insertion so the cap applies to current packet too.
-        self._evict_stale_and_overflow(timestamp_ms)
-        if frame not in self._pending:
+        try:
+            phase_packet = decode_packet(packet, relative_timestamp_ms)
+        except ValueError:
             return None
 
-        # Check if frame is complete
-        if len(self._pending[frame]) == self.num_optodes:
-            pending_frame = self._pending.pop(frame)
-            # Use timestamp from first packet received for this frame
-            first_timestamp = min(tp.timestamp_ms for tp in pending_frame.values())
-            packets = {optode_id: tp.packet for optode_id, tp in pending_frame.items()}
-            return CompleteFrame(
-                frame_number=frame,
-                timestamp_ms=first_timestamp,
-                packets=packets
-            )
+        if phase_packet.optode_id not in self._active_optode_set:
+            return None
+        if phase_packet.phase not in VALID_PHASES:
+            return None
 
-        return None
+        self._evict_stale_and_overflow(relative_timestamp_ms)
 
-    def pending_frames(self) -> int:
-        """Return number of incomplete frames in buffer."""
-        return len(self._pending)
+        frame_packets = self._pending.setdefault(phase_packet.frame_number, {})
+        optode_packets = frame_packets.setdefault(phase_packet.optode_id, {})
+        optode_packets[phase_packet.phase] = phase_packet
 
-    def clear(self):
-        """Clear all pending frames and reset start time."""
-        self._pending.clear()
-        self._start_time_ms = None  # Will be set on first packet
-        self._dropped_frames = 0
+        self._evict_stale_and_overflow(relative_timestamp_ms)
+        if phase_packet.frame_number not in self._pending:
+            return None
+
+        pending_frame = self._pending[phase_packet.frame_number]
+        is_complete = all(
+            optode_id in pending_frame and all(phase in pending_frame[optode_id] for phase in VALID_PHASES)
+            for optode_id in self.active_optodes
+        )
+        if not is_complete:
+            return None
+
+        completed = self._pending.pop(phase_packet.frame_number)
+        frame_timestamp_ms = min(
+            packet_record.timestamp_ms
+            for optode_phases in completed.values()
+            for packet_record in optode_phases.values()
+        )
+        phase_packets = {
+            optode_id: dict(optode_phases)
+            for optode_id, optode_phases in completed.items()
+        }
+        logical_samples = {
+            optode_id: reconstruct_logical_sample(optode_phases, frame_timestamp_ms)
+            for optode_id, optode_phases in phase_packets.items()
+        }
+        return AssembledFrame(
+            frame_number=phase_packet.frame_number,
+            timestamp_ms=frame_timestamp_ms,
+            phase_packets=phase_packets,
+            logical_samples=logical_samples,
+        )
 
     def dropped_frames(self) -> int:
-        """Return total number of dropped incomplete frames."""
         return self._dropped_frames
-
-
-if __name__ == '__main__':
-    from simulator import Simulator
-
-    frames = []
-    buffer = Buffer(num_optodes=2)
-
-    def collect(data: bytes):
-        complete_frame = buffer.add_packet(data)
-        if complete_frame:
-            frames.append(complete_frame)
-
-    sim = Simulator(num_optodes=2, sample_rate_hz=5.0)
-    sim.start(collect)
-    time.sleep(0.5)
-    sim.stop()
-
-    print(f"Collected {len(frames)} complete frames")
-    for complete_frame in frames[:3]:
-        print(f"\nFrame {complete_frame.frame_number} @ {complete_frame.timestamp_ms}ms:")
-        for optode_id, packet in sorted(complete_frame.packets.items()):
-            frame_num, optode = decode_metadata(packet)
-            print(f"  optode={optode} | frame_num={frame_num} | {packet.hex()}")
