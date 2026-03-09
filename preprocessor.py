@@ -45,6 +45,9 @@ ALPHA_740 = 0.10
 BETA_INIT = 0.1
 EPS = 1e-6
 
+K_HAMPEL = 3
+HAMPEL_WINDOW = 10
+
 
 class PreprocessedResult(NamedTuple):
     sample_id: int
@@ -79,6 +82,8 @@ class _OptodeState:
     short_od_740: Deque[float] = field(default_factory=lambda: deque(maxlen=REGRESSION_WINDOW))
     long_raw_od_860: Deque[float] = field(default_factory=lambda: deque(maxlen=REGRESSION_WINDOW))
     long_raw_od_740: Deque[float] = field(default_factory=lambda: deque(maxlen=REGRESSION_WINDOW))
+    clean_od_860_buffer: Deque[float] = field(default_factory=lambda: deque(maxlen=HAMPEL_WINDOW))
+    clean_od_740_buffer: Deque[float] = field(default_factory=lambda: deque(maxlen=HAMPEL_WINDOW))
     zi_860: Optional[np.ndarray] = None
     zi_740: Optional[np.ndarray] = None
 
@@ -154,6 +159,25 @@ class Preprocessor:
         cov_sl = float(np.mean(s_centered * l_centered))
         beta_new = cov_sl / var_s
         return float((1.0 - alpha) * beta + alpha * beta_new)
+    
+    def hampel(self, x_buffer, window, k):
+        if len(x_buffer) < window:
+            return x_buffer[-1]
+
+        win = np.array(list(x_buffer)[-window:])
+        med = np.median(win)
+        mad = np.median(np.abs(win - med))
+        # Convert MAD → robust std estimate
+        sigma = 1.4826 * mad
+        # Prevent divide / threshold collapse
+        if sigma < 1e-12:
+            return x_buffer[-1]
+
+        latest = x_buffer[-1]
+        if np.abs(latest - med) > k * sigma:
+            return med
+        else:
+            return latest
 
     def _process_values(
         self,
@@ -208,8 +232,14 @@ class Preprocessor:
         clean_od_740 = od_long_740 - state.beta_740 * od_short_740
         clean_od_860 = od_long_860 - state.beta_860 * od_short_860
 
-        filtered_od_740, state.zi_740 = self._apply_lowpass(clean_od_740, state.zi_740)
-        filtered_od_860, state.zi_860 = self._apply_lowpass(clean_od_860, state.zi_860)
+        state.clean_od_740_buffer.append(clean_od_740)
+        state.clean_od_860_buffer.append(clean_od_860)
+
+        clean_OD_740_unmotioned = self.hampel(state.clean_od_740_buffer, HAMPEL_WINDOW, K_HAMPEL)
+        clean_OD_860_unmotioned = self.hampel(state.clean_od_860_buffer, HAMPEL_WINDOW, K_HAMPEL)
+
+        filtered_od_740, state.zi_740 = self._apply_lowpass(clean_OD_740_unmotioned, state.zi_740)
+        filtered_od_860, state.zi_860 = self._apply_lowpass(clean_OD_860_unmotioned, state.zi_860)
 
         hbo_short, hbr_short = self._mbll(od_short_740, od_short_860, self.dpf_short, self.dist_short)
         hbo_long, hbr_long = self._mbll(filtered_od_740, filtered_od_860, self.dpf_long, self.dist_long)
@@ -266,5 +296,6 @@ class Preprocessor:
                 hbo_long=processed["hbo_long"],
                 hbr_long=processed["hbr_long"],
             )
+        #print(results)
 
         return results
