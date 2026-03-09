@@ -6,7 +6,7 @@ ACTIVE_OPTODES = [0, 1]   # Which of the 16 are connected
 SAMPLE_RATE_HZ = 34.0
 
 # Source selection
-DATA_SOURCE = "simulator"  # "simulator" or "uart"
+DATA_SOURCE = "uart"  # "simulator" or "uart"
 
 # UART source settings (used when DATA_SOURCE == "uart")
 UART_PORT = "/dev/cu.usbmodem1103"
