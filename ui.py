@@ -42,6 +42,14 @@ class MainScreen(Screen):
 
         self.on_start_callback = on_start
         self.on_stop_callback = on_stop
+        self.headmap_fig = None
+        self.headmap_ax = None
+        self.headmap_widget = None
+        self.headmap_colorbar = None
+        self.headmap_cmap = None
+        self.headmap_norm = None
+        self.optode_circles = {}
+        self.optode_labels = {}
 
         self.theme = {
             "window_bg": (0.94, 0.96, 0.98, 1.0),
@@ -177,7 +185,6 @@ class MainScreen(Screen):
         self.add_widget(root)
 
         self._init_graph_plot()
-        self._init_head_map()
         self._refresh_readouts()
 
     def _build_top_bar(self):
@@ -299,14 +306,7 @@ class MainScreen(Screen):
         self.graph_widget = self._FigureCanvasKivyAgg(self.graph_fig)
         graph_tab.add_widget(self.graph_widget)
 
-        headmap_tab = TabbedPanelItem(text="Optode Map")
-        self.headmap_fig, self.headmap_ax = self._plt.subplots(figsize=(5, 5))
-        self.headmap_fig.tight_layout(pad=1.0)
-        self.headmap_widget = self._FigureCanvasKivyAgg(self.headmap_fig)
-        headmap_tab.add_widget(self.headmap_widget)
-
         self.tabbed_panel.add_widget(graph_tab)
-        self.tabbed_panel.add_widget(headmap_tab)
         self.tabbed_panel.default_tab = graph_tab
         return self.tabbed_panel
 
@@ -401,7 +401,7 @@ class MainScreen(Screen):
         ax.tick_params(colors=self.theme["axis_text"], labelsize=8)
         ax.set_xlabel("Samples (Most Recent)", color=self.theme["axis_text"])
         ax.set_ylabel("Delta Hb (a.u.)", color=self.theme["axis_text"])
-        ax.set_title("Hemoglobin Trend (Long - Short)", color=self.theme["text_primary"], fontsize=11)
+        ax.set_title("Delta Hemoglobin Trend (Long MBLL)", color=self.theme["text_primary"], fontsize=11)
         ax.set_ylim(GRAPH_Y_MIN, GRAPH_Y_MAX)
         ax.grid(True, color=self.theme["grid"], linewidth=0.8, alpha=0.9)
         for spine in ax.spines.values():
@@ -415,8 +415,8 @@ class MainScreen(Screen):
     def update_graph(self, preprocessed_data: dict):
         """Update graph with new preprocessed data from one frame."""
         for optode_id, result in preprocessed_data.items():
-            hbo = result.hbo_long - result.hbo_short
-            hbr = result.hbr_long - result.hbr_short
+            hbo = result.hbo_long
+            hbr = result.hbr_long
 
             self.current_hbo[optode_id] = hbo
             self.current_hbr[optode_id] = hbr
@@ -477,6 +477,9 @@ class MainScreen(Screen):
 
     def _init_head_map(self):
         """Initialize head map with optode positions over background image."""
+        if self.headmap_fig is None or self.headmap_ax is None or self.headmap_widget is None:
+            return
+
         from matplotlib.patches import Circle
         import matplotlib.image as mpimg
         import os
@@ -502,7 +505,7 @@ class MainScreen(Screen):
         self.headmap_ax.set_ylim(0, 1)
         self.headmap_ax.set_aspect("equal")
         self.headmap_ax.axis("off")
-        self.headmap_ax.set_title("Optode Layout (Delta HbO)", fontsize=11, color=self.theme["text_primary"])
+        self.headmap_ax.set_title("Optode Layout (Delta HbO Long MBLL)", fontsize=11, color=self.theme["text_primary"])
 
         self.optode_circles = {}
         self.optode_labels = {}
@@ -548,6 +551,9 @@ class MainScreen(Screen):
         self.headmap_widget.draw()
 
     def _setup_colorbar(self):
+        if self.headmap_fig is None or self.headmap_ax is None:
+            return
+
         import matplotlib.colors as mcolors
         from matplotlib.cm import ScalarMappable, get_cmap
 
@@ -562,7 +568,7 @@ class MainScreen(Screen):
             orientation="horizontal",
             fraction=0.05,
             pad=0.03,
-            label="Delta HbO (a.u.)",
+            label="Delta HbO Long (a.u.)",
         )
         self.headmap_colorbar.ax.tick_params(labelsize=8, colors=self.theme["axis_text"])
         self.headmap_colorbar.outline.set_edgecolor(self.theme["axis_border"])
@@ -576,6 +582,13 @@ class MainScreen(Screen):
         return (1.0, 1.0, 1.0, 1.0)
 
     def _refresh_head_map(self):
+        if (
+            self.headmap_widget is None
+            or self.headmap_cmap is None
+            or self.headmap_norm is None
+        ):
+            return
+
         for optode_id in range(TOTAL_OPTODES):
             circle = self.optode_circles.get(optode_id)
             label = self.optode_labels.get(optode_id)
@@ -610,7 +623,7 @@ class MainScreen(Screen):
             self.readouts_label.text = "\n".join(lines)
             return
 
-        lines.append("[b]Optode | HbO Delta | HbR Delta | Status[/b]")
+        lines.append("[b]Optode | Delta HbO Long | Delta HbR Long | Status[/b]")
         lines.append("")
         for optode_id in sorted(ACTIVE_OPTODES):
             hbo = self.current_hbo.get(optode_id, 0.0)
@@ -620,7 +633,7 @@ class MainScreen(Screen):
             status_text = "ALERT" if flagged else "NORMAL"
             status_color = "cc2b23" if flagged else "287a46"
             lines.append(
-                f"Optode {optode_id:02d} | HbO {hbo:+.4f} | HbR {hbr:+.4f} | "
+                f"Optode {optode_id:02d} | HbO {hbo:+.2e} | HbR {hbr:+.2e} | "
                 f"[color={status_color}][b]{status_text}[/b][/color]"
             )
 
@@ -703,7 +716,6 @@ class MainScreen(Screen):
         self.current_hbr.clear()
         self.ich_flags.clear()
         self._init_graph_plot()
-        self._init_head_map()
         self._refresh_readouts()
 
     def set_session_active_state(self):

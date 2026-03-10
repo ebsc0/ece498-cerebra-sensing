@@ -43,7 +43,7 @@ PHASE_ORDER = (PHASE_740, PHASE_860, PHASE_DARK)
 TABLE_HEADER = " time       frame     opt  phase       meta        d0        d1        d2        d3  | raw"
 TABLE_RULE = " -----------------------------------------------------------------------------------------------"
 D2_Y_MIN = 0.0
-D2_Y_MAX = 2.0
+D2_Y_MAX = 0.5
 D2_Y_PAD = 0.01
 
 
