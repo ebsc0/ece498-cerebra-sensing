@@ -29,6 +29,7 @@ ICH_PERSISTENCE_RATIO = 0.3
 ICH_SESSION_WINDOW_SECONDS = 5.0
 ICH_SESSION_PERSISTENCE_RATIO = 0.6
 ICH_SESSION_MIN_FRAMES = 5
+ICH_DEMO_DELTA_HB_THRESHOLD = 3.0e-6  # Alert when the UI Delta Hb signal drifts this far from baseline.
 # Pair mapping used for hemisphere comparisons in detection.
 # For full hardware, define complete contralateral pairs (e.g. 0<->8, 1<->9, ...).
 ICH_OPTODE_PAIRS = {
@@ -39,8 +40,8 @@ ICH_OPTODE_PAIRS = {
 # UI settings
 MAX_PLOT_POINTS = 50
 UI_UPDATE_RATE_HZ = 10.0
-GRAPH_Y_MIN = -0.0005
-GRAPH_Y_MAX = 0.0005
+GRAPH_Y_MIN = -0.00005
+GRAPH_Y_MAX = 0.00005
 
 # Optical parameters for MBLL
 DPF_SHORT = 6.0           # Differential pathlength factor (short channel)

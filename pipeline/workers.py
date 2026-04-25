@@ -165,12 +165,12 @@ class PreprocessWorker:
                 flags, counts = detect_ich(ich_data, self.active_optodes)
                 frame_flagged = any(flags.values()) if flags else False
                 self._session_flag_history.append(frame_flagged)
-                if not self._session_hemorrhage_detected:
-                    history_len = len(self._session_flag_history)
-                    if history_len >= self.session_min_frames:
-                        ratio = sum(self._session_flag_history) / history_len
-                        if ratio >= self.session_persistence_ratio:
-                            self._session_hemorrhage_detected = True
+                history_len = len(self._session_flag_history)
+                session_detected = False
+                if history_len >= self.session_min_frames:
+                    ratio = sum(self._session_flag_history) / history_len
+                    session_detected = ratio >= self.session_persistence_ratio
+                self._session_hemorrhage_detected = session_detected
                 self.on_session_hemorrhage(self._session_hemorrhage_detected)
                 self.on_processed_frame()
 

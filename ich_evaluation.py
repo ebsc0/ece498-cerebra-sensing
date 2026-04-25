@@ -313,7 +313,7 @@ def run_trial(data, visualize=True, trial_type="Trial"):
             },
             [0, 1]
         )
-        if any(flag != "NORMAL" for flag in flags.values()):
+        if any(flags.values()):
             detection_frame = len(procA)
             break
 
